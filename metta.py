@@ -139,66 +139,7 @@ def vectorize_graph():
 
 vectorize_graph()
 
-# Neural Extractor for continual learning
-class NeuralExtractor:
-    def __init__(self):
-        try:
-            self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-            self.model = BertModel.from_pretrained('bert-base-uncased')
-            self.classifier = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
-            self.fine_tune()
-            logger.info("BERT models initialized and fine-tuned")
-        except Exception as e:
-            logger.error(f"BERT initialization failed: {e}")
-            sys.exit(1)
 
-    def fine_tune(self):
-        data = {
-            'text': [
-                "Uhuru Kenyatta is president of Kenya.",
-                "Jomo Kenyatta is father of Uhuru Kenyatta.",
-                "Kenya is a country."
-            ],
-            'label': [1, 1, 1]
-        }
-        dataset = Dataset.from_dict(data)
-        def tokenize_function(examples):
-            return self.tokenizer(examples['text'], padding='max_length', truncation=True, max_length=128)
-        dataset = dataset.map(tokenize_function, batched=True)
-        dataset.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
-
-        training_args = TrainingArguments(
-            output_dir='./bert-finetuned',
-            num_train_epochs=3,
-            per_device_train_batch_size=8,
-            logging_dir='./logs',
-            logging_steps=10,
-        )
-        trainer = Trainer(
-            model=self.classifier,
-            args=training_args,
-            train_dataset=dataset
-        )
-        trainer.train()
-        logger.info("BERT fine-tuned for fact extraction")
-
-    def extract_facts(self, text: str) -> List[tuple]:
-        # Generate candidate facts (simplified)
-        templates = [
-            f"{text.split(' ')[-1]} is a [MASK].",
-            f"{text.split(' ')[-1]} is [MASK] of Kenya."
-        ]
-        candidate_facts = []
-        for template in templates:
-            inputs = self.tokenizer(template, return_tensors='pt')
-            outputs = self.classifier(**inputs)
-            logits = outputs.logits
-            prob = torch.softmax(logits, dim=-1)[0, 1].item()
-            mask_token = template.replace("[MASK]", self.tokenizer.decode(torch.argmax(logits, dim=-1)))
-            candidate_facts.append((text, mask_token, prob))
-        return candidate_facts
-
-neural_extractor = NeuralExtractor()
 
 # LLM Integration (LangChain with GPT-4o-mini)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -261,50 +202,6 @@ def update_graph(domain: str, new_fact: str):
     except Exception as e:
         logger.error(f"Graph update failed: {e}")
 
-# Autonomous goal setting and execution 
-def autonomous_goal_setting():
-    while True:
-        time.sleep(30)  # Check every 30 seconds
-        goals = runner.run('!(match &self (goal $g) $g)')
-        if goals:
-            goal = goals[0]
-            if "Learn about" in goal:
-                entity = goal.split("Learn about")[-1].strip()
-                facts = neural_extractor.extract_facts(entity)
-                for entity, fact, conf in facts:
-                    runner.run(f'!(learn-fact "{entity}" "{fact}")')
-                vectorize_graph()
-                logger.info(f"Autonomous learning goal executed for {entity}")
-            elif "Reflect on" in goal:
-                interactions = das.query("interaction:*")
-                for inter in interactions[-5:]:  # Last 5
-                    runner.run(f'!(reflect "{inter}" 0.6)')  # Mock confidence
-                logger.info("Self-reflection goal executed")
-        else:
-            # Set default goal
-            runner.run('(set-goal "Learn about Uhuru Kenyatta")')
-            logger.info("Default goal set")
-
-# Memory storage (empath/autistic person)
-def store_memory(question: str, response: str, confidence: float = 0.85):
-    inter_id = str(uuid.uuid4())
-    das.add_atom(f"interaction:{inter_id}", f"Query: {question} Response: {response} Confidence: {confidence}")
-
-# Self-reflection in MeTTa (already in knowledge_metta)
-
-# Cross-domain transfer
-def cross_domain_transfer(domain1: str, domain2: str, pattern: str):
-    runner.run(f'(transfer-pattern {domain1} {domain2} "{pattern}")')
-    logger.info(f"Transferred pattern from {domain1} to {domain2}")
-
-# Continual learning function (narcissist/optimist)
-def continual_learning(entity: str):
-    web_result = web_search(f"Who is {entity}?")
-    facts = neural_extractor.extract_facts(web_result)
-    for entity, fact, conf in facts:
-        runner.run(f'!(learn-fact "{entity}" "{fact}")')
-    vectorize_graph()
-    logger.info(f"Continual learning: Added facts for {entity}")
 
 # Web Search Mock (enhanced for continual learning)
 def web_search(query: str) -> str:
@@ -314,28 +211,7 @@ def web_search(query: str) -> str:
     }
     return mock_results.get(query, "No web results found.")
 
-# Benchmarking
-def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str) -> float:
-    try:
-        mock_dataset = [
-            {'question': 'Who is Uhuru Kenyatta?', 'answer': 'President of Kenya'},
-            {'question': 'What is E=mc2?', 'answer': 'Einstein’s equation'}
-        ]
-        correct = 0
-        total = len(mock_dataset) + 1
-        for item in mock_dataset:
-            response = chain.invoke({"question": item['question']})
-            if item['answer'].lower() in response.lower():
-                correct += 1
-        response = chain.invoke({"question": question})
-        if ground_truth.lower() in response.lower():
-            correct += 1
-        accuracy = correct / total * 100
-        logger.info(f"CLEVR/VQA Accuracy: {accuracy:.2f}%")
-        return accuracy
-    except Exception as e:
-        logger.error(f"Benchmarking failed: {e}")
-        return 0.0
+
 
 # Save to playground
 def save_to_playground(question: str, output: str, history: list, accuracies: dict):
