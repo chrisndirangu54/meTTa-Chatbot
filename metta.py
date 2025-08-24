@@ -16,7 +16,7 @@ import json
 from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
 from datasets import Dataset
 
-# Setup logging (realist/autistic person)
+# Setup logging 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ dimension = 384  # MiniLM embedding size
 index = faiss.IndexFlatL2(dimension)
 atom_vectors = {}  # {atom_id: atom_text}
 
-# DAS Setup (realist/autistic person)
+# DAS Setup 
 class DASClient:
     def __init__(self, host='localhost', port=6379):
         try:
@@ -139,7 +139,7 @@ def vectorize_graph():
 
 vectorize_graph()
 
-# Neural Extractor for continual learning (optimist/narcissist)
+# Neural Extractor for continual learning
 class NeuralExtractor:
     def __init__(self):
         try:
@@ -261,7 +261,7 @@ def update_graph(domain: str, new_fact: str):
     except Exception as e:
         logger.error(f"Graph update failed: {e}")
 
-# Autonomous goal setting and execution (narcissist/realist)
+# Autonomous goal setting and execution 
 def autonomous_goal_setting():
     while True:
         time.sleep(30)  # Check every 30 seconds
@@ -292,7 +292,7 @@ def store_memory(question: str, response: str, confidence: float = 0.85):
 
 # Self-reflection in MeTTa (already in knowledge_metta)
 
-# Cross-domain transfer (optimist/autistic person)
+# Cross-domain transfer
 def cross_domain_transfer(domain1: str, domain2: str, pattern: str):
     runner.run(f'(transfer-pattern {domain1} {domain2} "{pattern}")')
     logger.info(f"Transferred pattern from {domain1} to {domain2}")
@@ -314,7 +314,7 @@ def web_search(query: str) -> str:
     }
     return mock_results.get(query, "No web results found.")
 
-# Benchmarking (realist)
+# Benchmarking
 def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str) -> float:
     try:
         mock_dataset = [
@@ -337,7 +337,7 @@ def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str) -> floa
         logger.error(f"Benchmarking failed: {e}")
         return 0.0
 
-# Save to playground (empath/optimist)
+# Save to playground
 def save_to_playground(question: str, output: str, history: list, accuracies: dict):
     try:
         data = {
