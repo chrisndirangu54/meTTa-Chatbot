@@ -219,64 +219,7 @@ chain = {
     "question": RunnablePassthrough()
 } | prompt | llm | parser
 
-# Dynamic MeTTa query with vector search
-def query_metta_dynamic(question: str) -> str:
-    try:
-        query_emb = embedder.encode(question)
-        _, indices = index.search(np.array([query_emb]), k=5)
-        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
-        entity = question.split("Who is")[-1].strip().rstrip('?') if "Who is" in question else question.split()[-1].rstrip('?')
-        domains = runner.run(f'!(match &self (in-domain {entity} $d) $d)') or ["General"]
-        domain = domains[0] if domains else "General"
-        faqs = runner.run(f'!(get-faq "{question}" {domain})') or ["No FAQ"]
-        roles = runner.run(f'!(get-roles {entity})') or ["Unknown"]
-        relations = runner.run(f'!(get-relations {entity} father-of)') or ["None"]
-        definition = runner.run(f'!(definition {entity})') or runner.run('!(definition Person)') or ["No definition"]
-        example = runner.run(f'!(example {entity})') or runner.run('!(example Person)') or ["No example"]
-        context = (
-            f"Domain: {domain}\n"
-            f"FAQ: {question} → {faqs[0]}\n"
-            f"Similar facts: {similar_atoms}\n"
-            f"Roles: {roles}\n"
-            f"Relations: {relations}\n"
-            f"Definition: {definition}\n"
-            f"Example: {example}"
-        )
-        logger.info(f"Dynamic MeTTa query result: {context}")
-        return context
-    except Exception as e:
-        logger.error(f"Dynamic MeTTa query failed: {e}")
-        return "Error querying knowledge graph."
-
-# Update knowledge graph (user-fed data, modular)
-def update_graph(domain: str, new_fact: str):
-    try:
-        if not new_fact.startswith('(= '):
-            new_fact = f'(= {new_fact} true)'
-        entity = new_fact.split()[1] if len(new_fact.split()) > 1 else "Unknown"
-        runner.run(f'(add-atom (in-domain {entity} {domain}) true)')
-        runner.run(new_fact)
-        vectorize_graph()
-        logger.info(f"Graph updated in domain {domain} with: {new_fact}")
-    except Exception as e:
-        logger.error(f"Graph update failed: {e}")
-
-# Autonomous goal setting and execution (narcissist/realist)
-def autonomous_goal_setting():
-    while True:
-        time.sleep(30)  # Check every 30 seconds
-        goals = runner.run('!(match &self (goal $g) $g)')
-        if goals:
-            goal = goals[0]
-            if "Learn about" in goal:
-                entity = goal.split("Learn about")[-1].strip()
-                facts = neural_extractor.extract_facts(entity)
-                for entity, fact, conf in facts:
-                    runner.run(f'!(learn-fact "{entity}" "{fact}")')
-                vectorize_graph()
-                logger.info(f"Autonomous learning goal executed for {entity}")
-            elif "Reflect on" in goal:
-                interactions = das.query("interaction:*")
+# interactions = das.query("interaction:*")
                 for inter in interactions[-5:]:  # Last 5
                     runner.run(f'!(reflect "{inter}" 0.6)')  # Mock confidence
                 logger.info("Self-reflection goal executed")
@@ -298,82 +241,7 @@ def cross_domain_transfer(domain1: str, domain2: str, pattern: str):
     logger.info(f"Transferred pattern from {domain1} to {domain2}")
 
 # Continual learning function (narcissist/optimist)
-def continual_learning(entity: str):
-    web_result = web_search(f"Who is {entity}?")
-    facts = neural_extractor.extract_facts(web_result)
-    for entity, fact, conf in facts:
-        runner.run(f'!(learn-fact "{entity}" "{fact}")')
-    vectorize_graph()
-    logger.info(f"Continual learning: Added facts for {entity}")
-
-# Web Search Mock (enhanced for continual learning)
-def web_search(query: str) -> str:
-    mock_results = {
-        "Who is Uhuru Kenyatta?": "Uhuru Kenyatta is a Kenyan politician, fourth president of Kenya (2013–2022), son of Jomo Kenyatta.",
-        "What is E=mc2?": "Einstein’s mass-energy equivalence equation."
-    }
-    return mock_results.get(query, "No web results found.")
-
-# Benchmarking 
-def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str) -> float:
-    try:
-        mock_dataset = [
-            {'question': 'Who is Uhuru Kenyatta?', 'answer': 'President of Kenya'},
-            {'question': 'What is E=mc2?', 'answer': 'Einstein’s equation'}
-        ]
-        correct = 0
-        total = len(mock_dataset) + 1
-        for item in mock_dataset:
-            response = chain.invoke({"question": item['question']})
-            if item['answer'].lower() in response.lower():
-                correct += 1
-        response = chain.invoke({"question": question})
-        if ground_truth.lower() in response.lower():
-            correct += 1
-        accuracy = correct / total * 100
-        logger.info(f"CLEVR/VQA Accuracy: {accuracy:.2f}%")
-        return accuracy
-    except Exception as e:
-        logger.error(f"Benchmarking failed: {e}")
-        return 0.0
-
-# Save to playground 
-def save_to_playground(question: str, output: str, history: list, accuracies: dict):
-    try:
-        data = {
-            'question': question,
-            'final_output': output,
-            'history': history,
-            'accuracies': accuracies,
-            'timestamp': logging.Formatter().formatTime(logging.makeLogRecord({}))
-        }
-        with open('playground_output.json', 'w') as f:
-            json.dump(data, f, indent=2)
-        logger.info("Saved to playground_output.json for metta-lang.dev")
-    except Exception as e:
-        logger.error(f"Playground save failed: {e}")
-
-# Chatbot loop
-def run_chatbot():
-    print("General FAQ Chatbot. Type 'exit' to quit, 'update <domain> <fact>' to add knowledge (e.g., update Science (= (E=mc2 Equation) true)).")
-    history = []
-    threading.Thread(target=autonomous_goal_setting, daemon=True).start()  # Autonomous loop
-    while True:
-        question = input("Ask a question: ")
-        if question.lower() == 'exit':
-            break
-        if question.lower().startswith('update'):
-            parts = question[6:].strip().split(' ', 1)
-            domain = parts[0] if len(parts) > 1 else "General"
-            new_fact = parts[1] if len(parts) > 1 else ""
-            update_graph(domain, new_fact)
-            print("Knowledge graph updated.")
-            history.append(f"Updated {domain}: {new_fact}")
-            continue
-        response = chain.invoke({"question": question})
-        confidence = 0.85  # Mock
-        store_memory(question, response, confidence)  # Memory
-        history.append(response)
+.append(response)
         accuracy = benchmark_clevr_vqa(runner, question, "President of Kenya" if "Uhuru Kenyatta" in question else "Unknown")
         save_to_playground(question, response, history, {'clevr_vqa': accuracy})
         # Self-reflection
