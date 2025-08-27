@@ -1,1622 +1,1533 @@
 import threading
-
 import time
-
 from hyperon import *
-
 from hyperon import MeTTa
-
 from hyperon import GroundingSpace
-
 from langchain_openai import ChatOpenAI
-
 from langchain_core.prompts import ChatPromptTemplate
-
 from langchain_core.output_parsers import StrOutputParser
-
 from langchain_core.runnables import RunnablePassthrough
-
 from sentence_transformers import SentenceTransformer
-
 import numpy as np
-
 import faiss
-
 import logging
-
 import uuid
-
 import json
-
 import redis
-
-from transformers import BertTokenizer, BertForSequenceClassification, BertModel, Trainer, TrainingArguments
-
+from transformers import BertTokenizer, BertModel, BertForSequenceClassification, Trainer, TrainingArguments
 from datasets import Dataset
-
-from typing import List, Any
-
+from typing import Dict, List, Any
 import torch
-
-import sys
-
+import torch_geometric as pyg
+from torch_geometric.nn import GraphSAGE
 import requests
-
 from ddgs import DDGS
-
 from tenacity import retry, wait_random_exponential, stop_after_attempt
-
 import sqlite3
-
 import subprocess
-
 import os
+import shutil
+from sklearn.metrics.pairwise import cosine_similarity
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-import shutil  # New import for checking executable
-
- 
 
 # Setup logging
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 logger = logging.getLogger(__name__)
+device = torch.device('cpu')
 
- 
-
+logger.info("Use pytorch device_name: cpu")
 # Cache for responses
-
 mock_responses = {}
 
- 
-
 # Initialize MeTTa and Atomspace
-
 space = GroundingSpace()
-
 runner = MeTTa(space=space.gspace)
-
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
- 
-
 # FAISS for vector search
-
 dimension = 384
-
 index = faiss.IndexFlatL2(dimension)
-
 atom_vectors = {}
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
- 
 
-# DAS Setup with enhanced Redis error handling
+# Pattern dataset for GNN training
+pattern_dataset = []
 
+# DAS Setup with Redis
 class DASClient:
-
-    def __init__(self, host='localhost', port=6379):
-
+    def __init__(self, host='127.0.0.1', port=6379):
         self.redis = None
-
         self.in_memory = {}
+        # Allow overriding Redis connection via environment variables
+        redis_host = os.environ.get("REDIS_HOST", host)
+        redis_port = int(os.environ.get("REDIS_PORT", port))
+        redis_url = os.environ.get("REDIS_URL")
 
+        # Try connecting first; if connection fails, try to start a local redis-server if available.
         try:
-
-            # Check if redis-server is installed
-
-            if shutil.which('redis-server') is None:
-
-                raise FileNotFoundError("redis-server executable not found")
-
-            # Attempt to start Redis
-
-            subprocess.run(['redis-server', '--daemonize', 'yes'], check=False)
-
-            time.sleep(1)
-
-            self.redis = redis.Redis(host=host, port=port, decode_responses=True)
-
+            if redis_url:
+                self.redis = redis.from_url(redis_url, decode_responses=True)
+            else:
+                self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
             self.redis.ping()
-
             logger.info("DAS client initialized with Redis backend")
-
-        except FileNotFoundError as e:
-
-            logger.error(f"DAS initialization failed: {e}. Redis is not installed.")
-
-            logger.info("To install Redis:")
-
-            logger.info("  - Ubuntu/Debian: sudo apt-get install redis-server")
-
-            logger.info("  - macOS: brew install redis")
-
-            logger.info("  - Windows: Download from https://github.com/redis/redis or use WSL")
-
-            logger.info("After installation, start Redis with: redis-server")
-
-            self.redis = None
-
-            runner.run(f'(add-atom (error "DAS Redis Not Installed" "{str(e)}"))')
-
-        except redis.ConnectionError as e:
-
-            logger.error(f"DAS initialization failed: {e}. Ensure Redis is running on {host}:{port}.")
-
-            logger.info("To start Redis: redis-server or sudo systemctl start redis")
-
-            self.redis = None
-
-            runner.run(f'(add-atom (error "DAS Connection" "{str(e)}"))')
-
         except Exception as e:
-
-            logger.error(f"DAS initialization failed: {e}. Falling back to in-memory storage.")
-
-            self.redis = None
-
-            runner.run(f'(add-atom (error "DAS General" "{str(e)}"))')
-
- 
+            logger.warning(f"Could not connect to Redis at {redis_url or f'{redis_host}:{redis_port}'}: {e}")
+            # Attempt to start local redis-server if available on PATH
+            if shutil.which('redis-server'):
+                try:
+                    logger.info("Attempting to start local redis-server...")
+                    subprocess.run(['redis-server', '--daemonize', 'yes'], check=False)
+                    time.sleep(1)
+                    if redis_url:
+                        self.redis = redis.from_url(redis_url, decode_responses=True)
+                    else:
+                        self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+                    self.redis.ping()
+                    logger.info("DAS client initialized with Redis backend after starting redis-server")
+                except Exception as e2:
+                    logger.error(f"Failed to start/connect to local redis-server: {e2}. Falling back to in-memory storage.")
+                    self.redis = None
+                    try:
+                        runner.run(f'(add-atom (error "DAS Redis Start Failed" "{str(e2)}"))')
+                    except Exception:
+                        logger.debug("Runner unavailable while reporting DAS Redis start failure")
+            else:
+                logger.info("Redis not available; using in-memory DAS. To enable Redis set REDIS_URL or install/start redis-server.")
+                logger.info("To install Redis:")
+                logger.info("  - Ubuntu/Debian: `sudo apt-get install redis-server`")
+                logger.info("  - macOS: `brew install redis`")
+                self.redis = None
+                try:
+                    runner.run(f'(add-atom (error "DAS Redis Not Installed" "{str(e)}"))')
+                except Exception:
+                    logger.debug("Runner unavailable while reporting DAS Redis not installed")
 
     def add_atom(self, atom: str, value: Any):
-
         try:
-
             if self.redis:
-
                 self.redis.set(atom, str(value))
-
             else:
-
                 self.in_memory[atom] = str(value)
-
             logger.info(f"Added atom {atom} to DAS")
-
+            logger.debug(f"In-memory storage: {self.in_memory}")
         except redis.ConnectionError as e:
-
             logger.error(f"DAS add_atom failed: {e}. Using in-memory storage.")
-
             self.in_memory[atom] = str(value)
-
+            logger.debug(f"In-memory storage: {self.in_memory}")
             runner.run(f'(add-atom (error "DAS Connection" "{str(e)}"))')
-
         except Exception as e:
-
             logger.error(f"DAS add_atom failed: {e}")
-
             runner.run(f'(add-atom (error "DAS General" "{str(e)}"))')
-
- 
-
     def query(self, pattern: str) -> List[str]:
-
         try:
-
             if self.redis:
-
                 keys = self.redis.keys(f"{pattern}*")
-
                 results = [self.redis.get(key) for key in keys]
-
             else:
-
                 results = [value for key, value in self.in_memory.items() if key.startswith(pattern)]
-
             logger.info(f"DAS query returned {len(results)} results")
-
             return results
-
         except redis.ConnectionError as e:
-
             logger.error(f"DAS query failed: {e}. Using in-memory storage.")
-
             runner.run(f'(add-atom (error "DAS Query" "{str(e)}"))')
-
             return [value for key, value in self.in_memory.items() if key.startswith(pattern)]
-
         except Exception as e:
-
             logger.error(f"DAS query failed: {e}")
-
             runner.run(f'(add-atom (error "DAS General" "{str(e)}"))')
-
             return []
-
- 
 
 das = DASClient()
 
- 
-
-# Load initial knowledge graph
-
+# Minimal knowledge graph
 knowledge_metta = """
-
 (: General Domain)
-
 (: Person Type)
-
 (: Role Type)
-
 (: Entity Type)
-
 (: ErrorType Type)
-
- 
-
-; Modular domain example
-
 (: Kenyan-Politics Domain)
-
-(add-atom (in-domain Uhuru-Kenyatta Kenyan-Politics) true)
-
 (: Science Domain)
 
- 
-
-; General inference rules
-
-(= (definition Person) "A human individual with roles and relationships.")
-
-(= (example Person) "Example: Individuals like Uhuru Kenyatta.")
-
-(= (definition Role) "A position or function, e.g., President.")
-
-(= (example Role) "Example: President of a country.")
-
- 
-
-; Dynamic relationship extraction
-
-(= (get-roles $entity)
-
-   (match &self (role $entity $r) $r))
-
- 
-
-(= (get-relations $entity $type)
-
-   (match &self ($type $entity $other) ($type $other)))
-
- 
+; Dynamic heuristic placeholder
+(= (heuristic $query $context)
+   (add-atom (heuristic-result $query $context)))
 
 ; Error handling
-
 (= (get-errors $type)
-
    (match &self (error $type $e) $e))
 
- 
-
-; Reverse inference
-
-(= (son-of $x $y) (father-of $y $x))
-
- 
-
 ; Domain selection
-
 (= (select-domain $domain)
-
    (match &self (in-domain $entity $domain) $entity))
 
- 
-
-; Self-reflection rule
-
-(= (reflect $interaction $confidence)
-
-   (if (< $confidence 0.7)
-
-      (refine-rule $interaction)
-
-      "No refinement needed"))
-
- 
-
-; Refine strategy
-
-(= (refine-rule $interaction)
-
-   (add-atom (improved-rule $interaction "Refined")))
-
- 
-
-; Cross-domain transfer
-
-(= (transfer-pattern $domain1 $domain2 $pattern)
-
-   (match &self (pattern $domain1 $pattern)
-
-      (add-atom (pattern $domain2 $pattern))))
-
- 
-
-; Goal setting
-
-(= (set-goal $goal)
-
-   (add-atom (goal $goal)))
-
- 
-
-; Continual learning rule
-
+; Continual learning
 (= (learn-fact $entity $fact)
-
    (add-atom (fact $entity $fact)))
 
- 
-
 ; Vectorized entity definition
-
-(= (definition vectorize-entity) "Embed extracted entities using SentenceTransformer for semantic search in FAISS")
-
+(= (definition vectorize-entity) "Embed entities using SentenceTransformer for FAISS search")
 """
-
 runner.run(knowledge_metta)
+logger.info("Minimal knowledge graph loaded.")
 
-logger.info("Initial knowledge graph loaded.")
+# GNN Setup
+class PatternGNN(torch.nn.Module):
+    def __init__(self, in_channels=384, hidden_channels=64, out_channels=1):
+        super().__init__()
+        self.gnn = GraphSAGE(in_channels, hidden_channels, num_layers=2, out_channels=out_channels)
+    
+    def forward(self, data):
+        return self.gnn(data.x, data.edge_index)
 
- 
+pattern_gnn = PatternGNN()
+pattern_gnn.to(torch.device('cpu'))  # Force cpu
 
-# Vectorize atoms
+optimizer = torch.optim.Adam(pattern_gnn.parameters(), lr=0.01)
 
-def vectorize_graph():
+# Build graph for GNN
 
-    global index, atom_vectors
 
+from hyperon import Atom, ExpressionAtom
+import numpy as np
+import torch
+import torch_geometric.data as pyg_data  # Use explicit import for clarity
+from typing import Optional, Tuple, Dict
+
+def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
+    """
+    Build a graph for GNN from MeTTa atoms and implications.
+    
+    Args:
+        query_emb: Optional query embedding for filtering atoms (384-dimensional).
+    
+    Returns:
+        Tuple of pyg.data.Data (graph with node features and edges) and node_map.
+    """
+    device = torch.device('cpu')  # Force CPU
+    logger.debug("Building graph with query_emb: %s", query_emb is not None)
+
+    # Retrieve all atoms from GroundingSpace
     atoms = runner.run('!(match &self $atom $atom)') or []
+    if not atoms:
+        logger.warning("No atoms found in GroundingSpace")
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
 
-    index = faiss.IndexFlatL2(dimension)
+    # Filter atoms using FAISS if query_emb is provided
+    if query_emb is not None:
+        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (384,):
+            logger.error(f"Invalid query embedding: shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
+            query_emb = None
+        else:
+            try:
+                _, indices = index.search(np.array([query_emb]), k=100)
+                atoms = [
+                    atom_vectors[list(atom_vectors.keys())[i]]
+                    for i in indices[0] if i < len(atom_vectors)
+                ]
+                logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
+            except Exception as e:
+                logger.error(f"FAISS search failed: %s", e)
+                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
+                query_emb = None
 
-    atom_vectors = {}
+    # Encode node features in batches
+    node_features = []
+    batch_size = 16
+    try:
+        for i in range(0, len(atoms), batch_size):
+            batch = atoms[i:i + batch_size]
+            embeddings = embedder.encode(
+                [str(atom) for atom in batch],
+                device='cpu',
+                convert_to_tensor=False
+            )
+            if embeddings.shape[1] != 384:
+                logger.error(f"Embedding dimension mismatch: got %d, expected 384", embeddings.shape[1])
+                raise ValueError("Embedding dimension mismatch")
+            node_features.extend(embeddings.tolist())
+    except Exception as e:
+        logger.error(f"Node feature encoding failed: %s", e)
+        runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
 
-    vectors = []
+    # Create node map
+    node_map = {str(atom): i for i, atom in enumerate(atoms)}
+    logger.debug("Node map created with %d nodes", len(node_map))
 
-    for atom in atoms:
+    # Retrieve implication edges
+    edges = []
+    implies_results = runner.run('!(match &self (= (implies $a $b) true) ($a $b))') or []
+    for result in implies_results:
+        try:
+            if isinstance(result, list) and len(result) == 2:
+                a, b = result
+            elif isinstance(result, Atom):
+                children = result.get_children()
+                if len(children) != 2:
+                    logger.warning("Implies result has %d children, expected 2", len(children))
+                    continue
+                a, b = children
+            else:
+                logger.warning("Unexpected implies result type: %s", type(result))
+                continue
 
-        atom_text = str(atom)
+            a_str, b_str = str(a), str(b)
+            if a_str in node_map and b_str in node_map:
+                edges.append((node_map[a_str], node_map[b_str]))
+            else:
+                logger.debug("Skipping edge (%s, %s): not in node map", a_str, b_str)
+        except Exception as e:
+            logger.error(f"Error processing implies result: %s", e)
+            runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
 
-        embedding = embedder.encode(atom_text)
+    # Construct graph tensors
+    try:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
+        x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
+    except Exception as e:
+        logger.error(f"Tensor creation failed: %s", e)
+        runner.run(f'(add-atom (error "Tensor Creation" "{str(e)}"))')
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
 
-        atom_id = str(uuid.uuid4())
+    # Handle query_emb tensor
+    query_emb_tensor = None
+    if query_emb is not None:
+        try:
+            if isinstance(query_emb, torch.Tensor):
+                query_emb_tensor = query_emb.detach().clone().to(device)
+            else:
+                query_emb_tensor = torch.tensor(query_emb, dtype=torch.float).to(device)
+        except Exception as e:
+            logger.error(f"Query embedding tensor creation failed: %s", e)
+            runner.run(f'(add-atom (error "Query Emb Tensor" "{str(e)}"))')
 
-        atom_vectors[atom_id] = atom_text
+    logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
+    return pyg_data.Data(x=x, edge_index=edge_index), node_map
 
-        vectors.append(embedding)
+def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
+    """
+    Build a graph for GNN from MeTTa atoms and implications.
+    
+    Args:
+        query_emb: Optional query embedding for filtering atoms (384-dimensional).
+    
+    Returns:
+        Tuple of pyg_data.Data (graph with node features and edges) and node_map.
+    """
+    device = torch.device('cpu')  # Force CPU
+    logger.debug("Building graph with query_emb: %s", query_emb is not None)
 
-        das.add_atom(f"embedding:{atom_id}", embedding.tolist())
+    # Add Uhuru Kenyatta facts to GroundingSpace
+    try:
+        runner.run('(add-atom (fact "uhuru-kenyatta" "born October 26, 1961, Nairobi, Kenya"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "son of Jomo Kenyatta and Mama Ngina Kenyatta"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "president of Kenya from 2013 to 2022"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "educated at St. Mary’s School, Nairobi and Amherst College, USA"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "net worth estimated at $500 million"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "married to Margaret Gakuo, three children"))')
+        runner.run('(add-atom (fact "uhuru-kenyatta" "ICC charges dropped in 2014"))')
+        logger.debug("Added Uhuru Kenyatta facts to GroundingSpace")
+    except Exception as e:
+        logger.error(f"Failed to add Uhuru Kenyatta facts: %s", e)
+        runner.run(f'(add-atom (error "Fact Addition" "{str(e)}"))')
 
-    if vectors:
+    # Retrieve all atoms from GroundingSpace
+    atoms = runner.run('!(match &self $atom $atom)') or []
+    if not atoms:
+        logger.warning("No atoms found in GroundingSpace")
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
 
-        index.add(np.array(vectors))
+    # Convert query_emb to NumPy if it's a tensor
+    if query_emb is not None:
+        if isinstance(query_emb, torch.Tensor):
+            query_emb = query_emb.detach().cpu().numpy()
+        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (384,):
+            logger.error(f"Invalid query embedding: type={type(query_emb)}, shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
+            query_emb = None
+        else:
+            try:
+                _, indices = index.search(np.array([query_emb]), k=100)
+                atoms = [
+                    atom_vectors[list(atom_vectors.keys())[i]]
+                    for i in indices[0] if i < len(atom_vectors)
+                ]
+                logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
+            except Exception as e:
+                logger.error(f"FAISS search failed: %s", e)
+                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
+                query_emb = None
 
-    logger.info("Knowledge graph vectorized.")
+    # Encode node features in batches
+    node_features = []
+    batch_size = 16
+    try:
+        for i in range(0, len(atoms), batch_size):
+            batch = atoms[i:i + batch_size]
+            embeddings = embedder.encode(
+                [str(atom) for atom in batch],
+                device='cpu',
+                convert_to_tensor=False
+            )
+            if embeddings.shape[1] != 384:
+                logger.error(f"Embedding dimension mismatch: got %d, expected 384", embeddings.shape[1])
+                raise ValueError("Embedding dimension mismatch")
+            node_features.extend(embeddings.tolist())
+    except Exception as e:
+        logger.error(f"Node feature encoding failed: %s", e)
+        runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
 
- 
+    # Create node map
+    node_map = {str(atom): i for i, atom in enumerate(atoms)}
+    logger.debug("Node map created with %d nodes", len(node_map))
+
+    # Retrieve and clean implication edges using MeTTa's unique
+    edges = []
+    implies_results = runner.run('!(unique (match &self (= (implies $a $b) true) ($a $b)))') or []
+    for result in implies_results:
+        try:
+            if isinstance(result, list) and len(result) == 2:
+                a, b = result
+            elif isinstance(result, Atom):
+                children = result.get_children()
+                if len(children) != 2:
+                    logger.warning("Implies result has %d children, expected 2", len(children))
+                    continue
+                a, b = children
+            else:
+                logger.warning("Unexpected implies result type: %s", type(result))
+                continue
+
+            a_str, b_str = str(a), str(b)
+            if a_str in node_map and b_str in node_map:
+                edges.append((node_map[a_str], node_map[b_str]))
+            else:
+                logger.debug("Skipping edge (%s, %s): not in node map", a_str, b_str)
+        except Exception as e:
+            logger.error(f"Error processing implies result: %s", e)
+            runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
+
+    # Construct graph tensors
+    try:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
+        x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
+    except Exception as e:
+        logger.error(f"Tensor creation failed: %s", e)
+        runner.run(f'(add-atom (error "Tensor Creation" "{str(e)}"))')
+        return pyg_data.Data(
+            x=torch.empty((0, 384), dtype=torch.float).to(device),
+            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
+        ), {}
+
+    # Handle query_emb tensor
+    query_emb_tensor = None
+    if query_emb is not None:
+        try:
+            query_emb_tensor = torch.tensor(query_emb, dtype=torch.float).to(device)
+        except Exception as e:
+            logger.error(f"Query embedding tensor creation failed: %s", e)
+            runner.run(f'(add-atom (error "Query Emb Tensor" "{str(e)}"))')
+
+    logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
+    return pyg_data.Data(x=x, edge_index=edge_index), node_map
+# Train GNN
+def train_pattern_gnn():
+    global pattern_dataset
+    try:
+        if len(pattern_dataset) < 10:
+            return
+        data, _ = build_graph()
+        if data.x.size(0) == 0 or data.edge_index.size(1) == 0:
+            logger.info("Empty graph, skipping GNN training")
+            return
+        device = torch.device('cpu')  # Force cpu
+        data = data.to(device)
+        pattern_gnn.to(device)  # Move model to cpu
+        pattern_gnn.train()
+        batch_size = 10
+        for i in range(0, len(pattern_dataset), batch_size):
+            batch = pattern_dataset[i:i+batch_size]
+            optimizer.zero_grad()
+            out = pattern_gnn(data)
+            target = torch.tensor([embedder.encode(p["heuristic"]).mean() for p in batch], dtype=torch.float).to(device).mean()
+            loss = torch.nn.MSELoss()(out.mean(), target)
+            loss.backward()
+            optimizer.step()
+        logger.info(f"Trained GNN with {len(pattern_dataset)} patterns")
+    except Exception as e:
+        logger.error(f"GNN training failed: {e}")
+        runner.run(f'(add-atom (error "GNN Training" "{str(e)}"))')
+# Vectorize graph
+def vectorize_graph():
+    """
+    Vectorize new atoms in the knowledge graph using CPU-only operations.
+    """
+    global index, atom_vectors, embedder
+    try:
+        # Initialize globals if not defined
+        if 'embedder' not in globals():
+            embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        if 'index' not in globals():
+            index = faiss.IndexFlatL2(384)  # Dimension for all-MiniLM-L6-v2
+        if 'atom_vectors' not in globals():
+            atom_vectors = {}
+
+        new_atoms = runner.run('!(match &self (new-atom $atom) $atom)') or []
+        logger.debug(f"New atoms: {new_atoms}")
+        if new_atoms:
+            # Process in batches to reduce memory usage
+            batch_size = 32
+            for i in range(0, len(new_atoms), batch_size):
+                batch = new_atoms[i:i + batch_size]
+                # Encode with CPU explicitly
+                vectors = embedder.encode([str(atom) for atom in batch], convert_to_tensor=True, device='cpu')
+                vectors = vectors.cpu().numpy()  # Convert to NumPy for FAISS
+                for atom, vector in zip(batch, vectors):
+                    atom_id = str(uuid.uuid4())
+                    atom_vectors[atom_id] = str(atom)
+                    index.add(np.array([vector]))
+                    logger.debug(f"Adding atom embedding:{atom_id} to DAS")
+                    das.add_atom(f"embedding:{atom_id}", vector.tolist())
+            # Clean up new atoms
+            runner.run('!(match &self (new-atom $atom) (delete-atom (new-atom $atom)))')
+        logger.info("Knowledge graph incrementally vectorized.")
+    except Exception as e:
+        logger.error(f"Vectorize graph failed: {e}")
+        runner.run(f'(add-atom (error "Vectorize Graph" "{str(e)}"))')
 
 vectorize_graph()
 
- 
-
 # Neural Extractor
-
-# Neural Extractor
-
 class NeuralExtractor:
-
     def __init__(self):
-
         try:
-
             self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-
-            self.model = BertModel.from_pretrained('bert-base-uncased')
-
+            self.model = BertModel.from_pretrained('bert-base-uncased').to('cpu')  # For embeddings
             self.classifier = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
-
             self.fine_tune()
-
             logger.info("BERT models initialized and fine-tuned")
-
         except Exception as e:
-
             logger.error(f"BERT initialization failed: {e}")
-
             runner.run(f'(add-atom (error "BERT Init" "{str(e)}"))')
-
-            # Continue without exiting, allowing fallback to other components
-
-            self.classifier = None  # Disable classifier if fine-tuning fails
-
- 
+            self.classifier = None
+            self.model = None
 
     def fine_tune(self):
-
         try:
-
-            # Dynamic dataset from knowledge graph
-
             facts = runner.run('!(match &self (fact $entity $fact) $fact)') or []
-
             texts = [str(f).split('"', 2)[-1].rstrip('")') for f in facts if len(str(f).split()) > 1]
-
-            # Fallback to static data if no facts
-
             if not texts:
-
-                texts = [
-
-                    "Uhuru Kenyatta is president of Kenya.",
-
-                    "Jomo Kenyatta is father of Uhuru Kenyatta.",
-
-                    "Kenya is a country."
-
-                ]
-
-            # Ensure labels match texts length
-
-            data = {
-
-                'text': texts,
-
-                'label': [1] * len(texts)  # Align labels with texts length
-
-            }
-
+                texts = ["Kenya is a country."]
+            # Add negative examples for better binary classification
+            negatives = [
+                "What is this?", "This sentence is not a fact.", "Random question?",
+                "How does it work?", "Irrelevant text without entities."
+            ]
+            data = {'text': texts + negatives, 'label': [1] * len(texts) + [0] * len(negatives)}
             dataset = Dataset.from_dict(data)
-
             def tokenize_function(examples):
-
-                return self.tokenizer(examples['text'], padding='max_length', truncation=True, max_length=128)
-
-            dataset = dataset.map(tokenize_function, batched=True)
-
+                return tokenizer(examples['text'], padding='max_length', truncation=True)
+            # Disable cache hashing
+            dataset = dataset.map(tokenize_function, batched=True, load_from_cache_file=False)
             dataset.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
-
- 
-
             training_args = TrainingArguments(
-
                 output_dir='./bert-finetuned',
-
                 num_train_epochs=3,
-
                 per_device_train_batch_size=8,
-
                 logging_dir='./logs',
-
                 logging_steps=10,
-
             )
-
-            trainer = Trainer(
-
-                model=self.classifier,
-
-                args=training_args,
-
-                train_dataset=dataset
-
-            )
-
+            trainer = Trainer(model=self.classifier, args=training_args, train_dataset=dataset)
             trainer.train()
-
-            logger.info("BERT fine-tuned for fact extraction")
-
+            logger.info("BERT fine-tuned for fact extraction with positives and negatives")
         except Exception as e:
-
             logger.error(f"BERT fine-tuning failed: {e}")
-
             runner.run(f'(add-atom (error "BERT Fine-Tune" "{str(e)}"))')
+            raise
 
-            raise  # Re-raise to be caught in __init__
+    # New method: Classify if a sentence is a fact
+    def classify_sentence(self, sentence: str) -> float:
+        if self.classifier is None:
+            return 0.0  # Fallback if init failed
+        inputs = self.tokenizer(sentence, return_tensors='pt', padding=True, truncation=True, max_length=128)
+        with torch.no_grad():
+            logits = self.classifier(**inputs).logits
+        probs = torch.nn.functional.softmax(logits, dim=1)
+        return probs[0][1].item()  # Probability for label 1 (fact)
 
- 
-
-    def extract_facts(self, text: str) -> List[tuple]:
-
-        if not self.classifier:
-
-            logger.warning("BERT classifier not initialized. Skipping fact extraction.")
-
-            runner.run('(add-atom (error "BERT Extract" "Classifier not initialized"))')
-
+    # New method: Get BERT embedding for a sentence
+    def get_embedding(self, sentence: str) -> list:
+        if self.model is None:
             return []
+        inputs = self.tokenizer(sentence, return_tensors='pt', padding=True, truncation=True, max_length=128)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        return outputs.last_hidden_state.mean(dim=1).squeeze().tolist()  # Mean pooling
+        # New method: Compute cosine similarity between two texts using embeddings
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        if self.model is None:
+            return 0.0
+        emb1 = np.array(self.get_embedding(text1)).reshape(1, -1)
+        emb2 = np.array(self.get_embedding(text2)).reshape(1, -1)
+        if emb1.size == 0 or emb2.size == 0:
+            return 0.0
+        return cosine_similarity(emb1, emb2)[0][0]
 
-        sentences = text.split('.')
-
-        facts = []
-
-        for sentence in sentences:
-
-            sentence = sentence.strip()
-
-            if not sentence:
-
+def extract_facts_lightweight(text: str, threshold: float = 0.7) -> List[tuple]:
+    sentences = text.split('.')
+    facts = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence or " is " not in sentence.lower():
+            logger.debug(f"Skipping sentence without 'is' or empty: '{sentence}'")
+            continue
+        try:
+            prob = neural_extractor.classify_sentence(sentence)
+            if prob < threshold:
+                logger.debug(f"Skipping low-confidence fact (prob={prob:.2f}): '{sentence}'")
                 continue
+            parts = sentence.split(" is ", 1)
+            if len(parts) != 2 or not all(parts):
+                logger.debug(f"Skipping malformed sentence: '{sentence}'")
+                continue
+            entity, fact = parts
+            # Clean entity: remove parentheticals, commas, etc.
+            entity = entity.split('(')[0].split(',')[0].strip().lower().replace(" ", "-").replace("--", "-")
+            embedding = neural_extractor.get_embedding(sentence)
+            facts.append((entity, fact.strip(), prob, embedding))
+            logger.debug(f"Extracted fact: entity='{entity}', fact='{fact.strip()}', prob={prob:.2f}")
+        except ValueError as e:
+            logger.warning(f"Failed to extract fact from sentence '{sentence}': {e}")
+            continue
+    if not facts:
+        logger.info(f"No valid facts extracted from text: {text[:100]}...")
+    else:
+        logger.info(f"Extracted {len(facts)} facts from text")
+    return facts
+neural_extractor = NeuralExtractor()
 
-            embedding = embedder.encode(sentence)
-
-            try:
-
-                inputs = self.tokenizer(sentence, return_tensors='pt')
-
-                outputs = self.classifier(**inputs)
-
-                prob = torch.softmax(outputs.logits, dim=-1)[0, 1].item()
-
-                if prob > 0.7:
-
-                    tokens = self.tokenizer.tokenize(sentence)
-
-                    entity = tokens[0] if tokens else ""
-
-                    for i, token in enumerate(tokens[1:], 1):
-
-                        if token in ['is', 'was', 'are', 'were']:
-
-                            entity = ' '.join(self.tokenizer.convert_tokens_to_string(tokens[:i]).split()[:2])
-
-                            break
-
-                    facts.append((entity, sentence, prob, embedding.tolist()))
-
-            except Exception as e:
-
-                logger.error(f"Fact extraction failed for sentence '{sentence}': {e}")
-
-                runner.run(f'(add-atom (error "BERT Extract" "{str(e)}"))')
-
-        return facts
-
-# LLM Integration with API key validation
-
+# LLM Integration
 def validate_openai_key(api_key: str) -> bool:
-
     try:
-
         test_client = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, max_retries=1)
-
         test_client.invoke("Test prompt")
-
         return True
-
     except Exception as e:
-
         logger.error(f"OpenAI API key validation failed: {e}")
-
         runner.run(f'(add-atom (error "OpenAI" "{str(e)}"))')
-
         return False
 
- 
-
-api_key = "sk-proj-hrlfdrRcNGKlz_N2TerAuSvp3v-1GogL7mGPb2CeldY2cXtJ2mwADEHd0LygZAATttLO6KnZxIT3BlbkFJMoPcs4NVHi5QDhkMQy7QZDVMXUIF-HlFal-Iz99OZ5ODacTePY1tMhyEJKV2NfQiyWcurD0cA"
-
+api_key = "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"
 llm_enabled = validate_openai_key(api_key)
-
- 
-
-llm = ChatOpenAI(
-
-    model="gpt-4o-mini",
-
-    temperature=0,
-
-    api_key=api_key,
-
-    max_retries=10
-
-) if llm_enabled else None
-
- 
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key, max_retries=10) if llm_enabled else None
 
 prompt = ChatPromptTemplate.from_template("""
-
-You are a general FAQ chatbot. Use the following context from the knowledge graph to answer the question.
-
+You are a general FAQ chatbot. Use the following context to answer the question.
 Context: {context}
-
- 
-
 Question: {question}
-
- 
-
-Provide a structured answer with definitions, examples, and references. If unsure, suggest updates. If an error occurs, respond with: "Sorry, I couldn't process that request. Try rephrasing or use commands like 'update <domain> <fact>' to add knowledge."
-
+Provide a structured answer with definitions, examples, and references. If unsure, suggest updates.
 """)
-
- 
-
 parser = StrOutputParser()
+chain = {"context": lambda x: query_metta_dynamic(x["question"]), "question": RunnablePassthrough()} | prompt | llm | parser if llm_enabled else lambda x: query_metta_dynamic(x["question"]) + "\nLLM disabled."
 
- 
-
-chain = {
-
-    "context": lambda x: query_metta_dynamic(x["question"]),
-
-    "question": RunnablePassthrough()
-
-} | prompt | llm | parser if llm_enabled else lambda x: query_metta_dynamic(x["question"]) + "\nLLM disabled due to invalid API key."
-
- 
-
-# Dynamic MeTTa query
+# Hybrid Reasoning with GNN
+def infer_reasoning_pattern(question: str, context: str) -> dict:
+    try:
+        query_emb = embedder.encode(question).tolist()
+        context_emb = embedder.encode(context).tolist()
+        pattern_data = [d for d in pattern_dataset if np.linalg.norm(np.array(d["query_emb"]) - np.array(query_emb)) < 0.5]
+        if not pattern_data:
+            logger.info(f"No matching patterns for query: {question}")
+            return {"heuristic": f"(= (heuristic \"{question}\" $context) (fallback-answer))", "confidence": 0.75}
+        
+        confidences = [d["confidence"] for d in pattern_data]
+        max_confidence = max(confidences) if confidences else 0.75
+        best_pattern = pattern_data[confidences.index(max_confidence)]["heuristic"] if confidences else f"(= (heuristic \"{question}\" $context) (fallback-answer))"
+        return {"heuristic": best_pattern, "confidence": max_confidence}
+    except Exception as e:
+        logger.error(f"infer_reasoning_pattern failed for query '{question}': {e}")
+        return {"heuristic": f"(= (heuristic \"{question}\" $context) (fallback-answer))", "confidence": 0.75}
 
 def query_metta_dynamic(question: str) -> str:
-
     try:
+        # Normalize query
+        normalized_question = question
+        if question.lower().startswith("who ") and " is " not in question.lower():
+            normalized_question = question.replace("Who ", "Who is ", 1)
+            logger.info(f"Normalized query in query_metta_dynamic: '{question}' to '{normalized_question}'")
+        question = normalized_question
 
-        # Improved entity extraction
+        cached_response = das.query(f"response:{question}:*")
+        if cached_response:
+            logger.info(f"Returning cached response for query: {question}")
+            return f"{cached_response[0]}\nRecent Errors: None"
 
-        entity = ""
-
-        lower_q = question.lower().strip()
-
-        if "who is the president of kenya" in lower_q:
-
-            entity = "William-Ruto"  # Hardcode for specific query to match seeded facts
-
-        elif "who is" in lower_q:
-
-            entity = question.split("Who is")[-1].strip().rstrip('?').replace(" ", "-")
-
-        elif "what is" in lower_q:
-
-            entity = question.split("What is")[-1].strip().rstrip('?').replace(" ", "-")
-
-        else:
-
-            entity = ' '.join(question.split()[1:]).rstrip('?').replace(" ", "-")
-
- 
-
-        # Vector search for similar atoms
-
-        query_emb = embedder.encode(entity if entity else question)
-
+        query_emb = embedder.encode(question)
+        logger.debug(f"Encoded query '{question}' to embedding")
         _, indices = index.search(np.array([query_emb]), k=5)
-
         similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
-
- 
-
-        # Query knowledge graph with debug logging
-
-        domains = runner.run(f'!(match &self (in-domain "{entity}" $d) $d)') or ["General"]
-
-        if not domains:
-
-            logger.warning(f"No domains found for entity: {entity}")
-
-            runner.run(f'(add-atom (error "Query Domain" "No domains for {entity}"))')
-
+        domains = runner.run(f'!(select-domain $domain)') or ["General"]
         domain = domains[0] if domains else "General"
+        context = f"Similar facts: {similar_atoms}\nDomain: {domain}"
+        logger.debug(f"Context for query '{question}': {context}")
 
- 
+        # Check for stored facts (case-insensitive)
+        entity = None
+        if "who is" in question.lower():
+            entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")  # Fix double hyphens
+            logger.info(f"Extracted entity for fact retrieval: {entity}")
+            facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
+            logger.debug(f"Facts for {entity}: {facts}")
+            if facts:
+                return f"{facts[0]}\nRecent Errors: None"
 
-        faqs = runner.run(f'!(get-faq "{question}" {domain})') or ["No FAQ"]
+        # Trigger continual learning if no facts found
+        if entity and not facts:
+            logger.info(f"Triggering continual learning for entity: {entity}")
+            try:
+                continual_learning(entity)
+                facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")  # Re-check
+                if facts:
+                    return f"{facts[0]}\nRecent Errors: None"
+            except Exception as e:
+                logger.error(f"Continual learning in query_metta_dynamic failed for {entity}: {e}")
+                runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
 
-        roles = runner.run(f'!(get-roles "{entity}")') or ["Unknown"]
-
-        if roles == ["Unknown"]:
-
-            logger.warning(f"No roles found for entity: {entity}")
-
-            runner.run(f'(add-atom (error "Query Roles" "No roles for {entity}"))')
-
- 
-
-        relations = runner.run(f'!(get-relations "{entity}" father-of)') or ["None"]
-
-        if relations == ["None"]:
-
-            logger.debug(f"No father-of relations for entity: {entity}")
-
- 
-
-        definition = runner.run(f'!(definition "{entity}")') or runner.run('!(definition Person)') or ["No definition"]
-
-        if definition == ["No definition"]:
-
-            logger.warning(f"No definition found for entity: {entity}")
-
-            runner.run(f'(add-atom (error "Query Definition" "No definition for {entity}"))')
-
- 
-
-        example = runner.run(f'!(example "{entity}")') or runner.run('!(example Person)') or ["No example"]
-
-        if example == ["No example"]:
-
-            logger.warning(f"No example found for entity: {entity}")
-
-            runner.run(f'(add-atom (error "Query Example" "No example for {entity}"))')
-
- 
+        heuristic_response = infer_reasoning_pattern(question, context)
+        logger.debug(f"Heuristic response for '{question}': {heuristic_response}")
+        if heuristic_response["confidence"] >= 0.7:
+            runner.run(heuristic_response["heuristic"])
+            result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
+            response = result[0] if result else "No heuristic result."
+            das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+        else:
+            if llm_enabled:
+                heuristic_prompt = ChatPromptTemplate.from_template("""
+                Generate a MeTTa heuristic rule to process the query dynamically...
+                Output in JSON format:
+                {
+                  "heuristic": "(= (heuristic \\"{question}\\" $context) $action)",
+                  "confidence": <float>
+                }
+                """)
+                try:
+                    heuristic_response = json.loads((heuristic_prompt | llm | parser).invoke({"question": question, "context": context}))
+                    logger.debug(f"LLM-generated heuristic: {heuristic_response}")
+                    if heuristic_response["confidence"] >= 0.7:
+                        runner.run(heuristic_response["heuristic"])
+                        result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
+                        response = result[0] if result else "No heuristic result."
+                        das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+                        pattern_dataset.append({
+                            "query_emb": query_emb.tolist(),
+                            "context_emb": embedder.encode(context).tolist(),
+                            "heuristic": heuristic_response["heuristic"],
+                            "confidence": heuristic_response["confidence"]
+                        })
+                        train_pattern_gnn()
+                    else:
+                        das.add_atom(f"pending_heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+                        response = f"Low-confidence heuristic (score: {heuristic_response['confidence']}). Stored for review."
+                except Exception as e:
+                    logger.error(f"LLM heuristic generation failed: {e}")
+                    runner.run(f'(add-atom (error "LLM Heuristic" "{str(e)}"))')
+                    response = generate_rule_based_heuristic(question, context)
+            else:
+                logger.info(f"LLM disabled, using rule-based heuristic for query: {question}")
+                response = generate_rule_based_heuristic(question, context)
 
         errors = runner.run(f'!(get-errors $type)') or ["None"]
-
- 
-
-        context = (
-
-            f"Domain: {domain}\n"
-
-            f"FAQ: {question} → {faqs[0]}n"
-
-            f"Similar facts: {similar_atoms}n"
-
-            f"Roles: {roles}n"
-
-            f"Relations: {relations}n"
-
-            f"Definition: {definition}n"
-
-            f"Example: {example}n"
-
-            f"Recent Errors: {errors}"
-
-        )
-
-        logger.info(f"Dynamic MeTTa query result: {context}")
-
-        return context
-
+        response = f"{response}\nRecent Errors: {errors}"
+        das.add_atom(f"response:{question}:{uuid.uuid4()}", response)
+        logger.info(f"Dynamic MeTTa query result for '{question}': {response}")
+        return response
     except Exception as e:
-
-        logger.error(f"Dynamic MeTTa query failed: {e}")
-
+        logger.error(f"Dynamic MeTTa query failed for '{question}': {e}")
         runner.run(f'(add-atom (error "Query" "{str(e)}"))')
+        return f"Sorry, I couldn't process that request due to an internal error: {str(e)}"
+            
+def generate_rule_based_heuristic(question: str, context: str) -> str:
+    """Generate a simple MeTTa heuristic when LLM is unavailable."""
+    if "who is" in question.lower():
+        entity = question.lower().split("who is")[-1].strip("?")
+        heuristic = f"(= (heuristic \"{question}\" $context) (match &self (fact \"{entity}\" $fact) $fact))"
+        confidence = 0.75
+    elif "what is" in question.lower():
+        entity = question.lower().split("what is")[-1].strip("?")
+        heuristic = f"(= (heuristic \"{question}\" $context) (match &self (fact $entity \"{entity}\") $entity))"
+        confidence = 0.75
+    else:
+        heuristic = f"(= (heuristic \"{question}\" $context) (match &self (fact $entity $fact) $entity))"
+        confidence = 0.6
+    das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic} (Confidence: {confidence})")
+    runner.run(heuristic)
+    result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No rule-based result"]
+    return result[0] if result else f"No rule-based result. Confidence: {confidence}"
 
-        return "Sorry, I couldn't process that request. Try rephrasing or use commands like 'update <domain> <fact>' to add knowledge."
-
- 
-
-# Chatbot loop
-
-def run_chatbot():
-
-    print("General FAQ Chatbot. Type 'exit' to quit, 'update <domain> <fact>' to add knowledge (e.g., update Kenyan-Politics (= (role William-Ruto president) true)).")
-
-    print("Note: LLM may be disabled due to invalid OpenAI API key. Update the key in the script to enable.")
-
-    print("Note: Redis is required for persistent storage. Install with: sudo apt-get install redis-server (Ubuntu) or brew install redis (macOS).")
-
- 
-
-    # Initialize knowledge graph with Ruto's presidency
-
-    logger.info("Initializing knowledge graph with William Ruto facts")
-
-    update_graph("Kenyan-Politics", "(= (role William-Ruto president) true)")
-
-    update_graph("Kenyan-Politics", '(= (definition William-Ruto) "President of Kenya since September 13, 2022")')
-
-    update_graph("Kenyan-Politics", '(= (example William-Ruto) "William Ruto, elected on August 9, 2022, under the United Democratic Alliance")')
-
- 
-
-    # Debug: Verify initialization
-
-    roles_check = runner.run('!(get-roles "William-Ruto")') or ["Unknown"]
-
-    logger.info(f"Initial roles for William-Ruto: {roles_check}")
-
-    if roles_check == ["Unknown"]:
-
-        runner.run('(add-atom (error "Init Roles" "Failed to initialize William-Ruto roles"))')
-
- 
-
-    history = []
-
-    threading.Thread(target=autonomous_goal_setting, daemon=True).start()
-
- 
-
-    while True:
-
-        question = input("Ask a question: ")
-
-        if question.lower() == 'exit':
-
-            break
-
-        if question.lower() == 'errors':
-
-            errors = runner.run('!(get-errors $type)') or ["No recent errors"]
-
-            print("Recent Errors:", errors)
-
-            continue
-
-        if question.lower().startswith('update'):
-
-            parts = question[6:].strip().split(' ', 1)
-
-            domain = parts[0] if len(parts) > 1 else "General"
-
-            new_fact = parts[1] if len(parts) > 1 else ""
-
-            update_graph(domain, new_fact)
-
-            print("Knowledge graph updated.")
-
-            history.append(f"Updated {domain}: {new_fact}")
-
-            continue
-
+# Heuristic Review
+def review_heuristics(manual=False):
+    try:
+        pending_heuristics = das.query("pending_heuristic:*")
+        if not pending_heuristics:
+            logger.info("No pending heuristics to review.")
+            return "No pending heuristics."
+        
+        results = []
+        if llm_enabled and not manual:
+            review_prompt = ChatPromptTemplate.from_template("""
+            Review the following pending heuristics and decide whether to approve, refine, or discard each one...
+            Output in JSON format:
+            [
+              {
+                "original": "<original heuristic>",
+                "decision": "approve|refine|discard",
+                "refined": "<refined heuristic or null>",
+                "confidence": <float>
+              }
+            ]
+            """)
+            try:
+                review_results = json.loads((review_prompt | llm | parser).invoke({
+                    "heuristics": pending_heuristics,
+                    "interactions": das.query("interaction:*")[-5:] or ["No recent interactions"]
+                }))
+                for result in review_results:
+                    original = result["original"]
+                    decision = result["decision"]
+                    refined = result["refined"]
+                    confidence = result["confidence"]
+                    if decision == "approve" and confidence >= 0.7:
+                        runner.run(original)
+                        das.add_atom(f"heuristic:{uuid.uuid4()}", f"{original} (Confidence: {confidence})")
+                        results.append(f"Approved heuristic: {original}")
+                    elif decision == "refine" and refined and confidence >= 0.7:
+                        runner.run(refined)
+                        das.add_atom(f"heuristic:{uuid.uuid4()}", f"{refined} (Confidence: {confidence})")
+                        results.append(f"Refined heuristic: {refined}")
+                    else:
+                        results.append(f"Discarded heuristic: {original}")
+                    das.add_atom(f"reviewed_heuristic:{uuid.uuid4()}", f"{original} -> {decision}")
+            except Exception as e:
+                logger.error(f"LLM heuristic review failed: {e}")
+                runner.run(f'(add-atom (error "LLM Heuristic Review" "{str(e)}"))')
+                results = manual_heuristic_review(pending_heuristics)
+        else:
+            logger.info("LLM disabled or manual review requested, using manual heuristic review")
+            results = manual_heuristic_review(pending_heuristics)
+        
+        vectorize_graph()
+        logger.info(f"Reviewed {len(pending_heuristics)} heuristics: {results}")
+        return "\n".join(results)
+    except Exception as e:
+        logger.error(f"Heuristic review failed: {e}")
+        runner.run(f'(add-atom (error "Heuristic Review" "{str(e)}"))')
+        return f"Failed to review heuristics: {str(e)}"
+    
+def manual_heuristic_review(pending_heuristics: List[str]) -> List[str]:
+    """Manually review heuristics when LLM is unavailable."""
+    results = []
+    for heuristic in pending_heuristics:
         try:
-
-            response = safe_invoke(chain, {"question": question}) if llm_enabled else query_metta_dynamic(question) + "nLLM disabled due to invalid API key."
-
-        except RateLimitError:
-
-            logger.error("Rate limit hit despite retries.")
-
-            response = "Sorry, I couldn't process that request due to API rate limits. Try rephrasing or use commands like 'update <domain> <fact>' to add knowledge."
-
-            runner.run('(add-atom (error "Rate Limit" "OpenAI API rate limit exceeded"))')
-
+            # Extract confidence from heuristic string (e.g., "(Confidence: 0.6)")
+            confidence = float(heuristic.split("Confidence:")[-1].strip(" )")) if "Confidence:" in heuristic else 0.6
+            original = heuristic.split(" (Confidence:")[0]
+            if confidence >= 0.8:
+                runner.run(original)
+                das.add_atom(f"heuristic:{uuid.uuid4()}", f"{original} (Confidence: {confidence})")
+                results.append(f"Approved heuristic: {original}")
+            else:
+                results.append(f"Discarded heuristic: {original} (low confidence: {confidence})")
+            das.add_atom(f"reviewed_heuristic:{uuid.uuid4()}", f"{original} -> {'approve' if confidence >= 0.8 else 'discard'}")
         except Exception as e:
+            logger.error(f"Manual heuristic review failed for {heuristic}: {e}")
+            results.append(f"Failed to review heuristic: {heuristic}")
+    return results
 
-            logger.error(f"LLM invocation failed: {e}")
+# Continual Learning
+def query_metta_dynamic(question: str) -> str:
+    try:
+        # Normalize query
+        normalized_question = question
+        if question.lower().startswith("who ") and " is " not in question.lower():
+            normalized_question = question.replace("Who ", "Who is ", 1)
+            logger.info(f"Normalized query in query_metta_dynamic: '{question}' to '{normalized_question}'")
+        question = normalized_question
 
-            response = "Sorry, I couldn't process that request. Try rephrasing or use commands like 'update <domain> <fact>' to add knowledge."
+        cached_response = das.query(f"response:{question}:*")
+        if cached_response:
+            logger.info(f"Returning cached response for query: {question}")
+            return f"{cached_response[0]}\nRecent Errors: None"
 
-            runner.run(f'(add-atom (error "LLM" "{str(e)}"))')
+        query_emb = embedder.encode(question)
+        logger.debug(f"Encoded query '{question}' to embedding")
+        _, indices = index.search(np.array([query_emb]), k=5)
+        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
+        domains = runner.run(f'!(select-domain $domain)') or ["General"]
+        domain = domains[0] if domains else "General"
+        context = f"Similar facts: {similar_atoms}\nDomain: {domain}"
+        logger.debug(f"Context for query '{question}': {context}")
 
- 
+        # Check for stored facts (case-insensitive)
+        entity = None
+        if "who is" in question.lower():
+            entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")
+            logger.info(f"Extracted entity for fact retrieval: {entity}")
+            facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
+            logger.debug(f"Facts for {entity}: {facts}")
+            if facts:
+                logger.info(f"Retrieved fact: {facts[0]}")
+                return f"{facts[0]}\nRecent Errors: None"
 
-        confidence = 0.85
-
-        store_memory(question, response, confidence)
-
-        history.append(response)
-
-        accuracy = benchmark_clevr_vqa(runner, question, "William Ruto" if "president of Kenya" in question.lower() else "Unknown", response)
-
-        save_to_playground(question, response, history, {'clevr_vqa': accuracy})
-
-        runner.run(f'!(reflect "Query: {question}" {confidence})')
-
- 
-
-        lower_q = question.lower()
-
-        if "who is" in lower_q or "what is" in lower_q:
-
-            entity = (
-                question.split("Who is")[-1].strip().rstrip('?') if "Who is" in question else
-                question.split("who is")[-1].strip().rstrip('?') if "who is" in lower_q else
-                question.split("What is")[-1].strip().rstrip('?') if "What is" in question else
-                question.split("what is")[-1].strip().rstrip('?')
-            )
-
-            if entity:
-
+        # Trigger continual learning if no facts found
+        if entity and not facts:
+            logger.info(f"Triggering continual learning for entity: {entity}")
+            try:
                 continual_learning(entity)
+                facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
+                logger.debug(f"Facts after continual learning for {entity}: {facts}")
+                if facts:
+                    logger.info(f"Retrieved fact after learning: {facts[0]}")
+                    return f"{facts[0]}\nRecent Errors: None"
+            except Exception as e:
+                logger.error(f"Continual learning in query_metta_dynamic failed for {entity}: {e}")
+                runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
 
-                cross_domain_transfer("Kenyan-Politics", "Science", "(implies (role X president) (role X leader))")
+        heuristic_response = infer_reasoning_pattern(question, context)
+        logger.debug(f"Heuristic response for '{question}': {heuristic_response}")
+        if heuristic_response["confidence"] >= 0.7:
+            runner.run(heuristic_response["heuristic"])
+            result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
+            response = result[0] if result else "No heuristic result."
+            das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+        else:
+            if llm_enabled:
+                heuristic_prompt = ChatPromptTemplate.from_template("""
+                Generate a MeTTa heuristic rule to process the query dynamically...
+                Output in JSON format:
+                {
+                  "heuristic": "(= (heuristic \\"{question}\\" $context) $action)",
+                  "confidence": <float>
+                }
+                """)
+                try:
+                    heuristic_response = json.loads((heuristic_prompt | llm | parser).invoke({"question": question, "context": context}))
+                    logger.debug(f"LLM-generated heuristic: {heuristic_response}")
+                    if heuristic_response["confidence"] >= 0.7:
+                        runner.run(heuristic_response["heuristic"])
+                        result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
+                        response = result[0] if result else "No heuristic result."
+                        das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+                        pattern_dataset.append({
+                            "query_emb": query_emb.tolist(),
+                            "context_emb": embedder.encode(context).tolist(),
+                            "heuristic": heuristic_response["heuristic"],
+                            "confidence": heuristic_response["confidence"]
+                        })
+                        train_pattern_gnn()
+                    else:
+                        das.add_atom(f"pending_heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
+                        response = f"Low-confidence heuristic (score: {heuristic_response['confidence']}). Stored for review."
+                except Exception as e:
+                    logger.error(f"LLM heuristic generation failed: {e}")
+                    runner.run(f'(add-atom (error "LLM Heuristic" "{str(e)}"))')
+                    response = generate_rule_based_heuristic(question, context)
+            else:
+                logger.info(f"LLM disabled, using rule-based heuristic for query: {question}")
+                response = generate_rule_based_heuristic(question, context)
 
- 
-
-        print("Response:", response)
-
- 
-
-# Update knowledge graph
-
-def update_graph(domain: str, new_fact: str):
-
-    try:
-
-        if not new_fact.startswith('(= '):
-
-            new_fact = f'(= {new_fact} true)'
-
-        entity = new_fact.split()[1] if len(new_fact.split()) > 1 else "Unknown"
-
-        runner.run(f'(add-atom (in-domain {entity} {domain}) true)')
-
-        runner.run(new_fact)
-
-        vectorize_graph()
-
-        logger.info(f"Graph updated in domain {domain} with: {new_fact}")
-
+        errors = runner.run(f'!(get-errors $type)') or ["None"]
+        response = f"{response}\nRecent Errors: {errors}"
+        das.add_atom(f"response:{question}:{uuid.uuid4()}", response)
+        logger.info(f"Dynamic MeTTa query result for '{question}': {response}")
+        return response
     except Exception as e:
+        logger.error(f"Dynamic MeTTa query failed for '{question}': {e}")
+        runner.run(f'(add-atom (error "Query" "{str(e)}"))')
+        return f"Sorry, I couldn't process that request due to an internal error: {str(e)}"
+    
+def generate_fallback_rule(entity: str, facts: List[tuple]) -> str:
+    """Generate a fallback MeTTa rule when LLM is unavailable."""
+    if not facts:
+        return ""
+    fact = facts[0][1]  # Use first fact
+    return f"(= (implies (fact \"{entity}\" \"{fact}\") (role \"{entity}\" entity)) true)"
 
-        logger.error(f"Graph update failed: {e}")
-
-        runner.run(f'(add-atom (error "Update" "{str(e)}"))')
-
- 
-
-# Vectorized continual learning
-
-def continual_learning(entity: str):
-
-    try:
-
-        web_result = web_search(f"Who is {entity}?")
-
-        if not web_result or "No web results found" in web_result:
-
-            logger.info(f"No web results for {entity}, skipping continual learning")
-
-            return
-
-        neural_extractor = NeuralExtractor()
-
-        facts = neural_extractor.extract_facts(web_result)
-
-        if not facts:
-
-            logger.info(f"No valid facts extracted for {entity}")
-
-            return
-
-        existing_facts = das.query(f"fact:{entity}:*")
-
-        existing_vectors = [np.array(json.loads(das.query(f"entity_vector:{entity}:")[i])) for i in range(len(existing_facts)) if das.query(f"entity_vector:{entity}:")]
-
-        for new_entity, fact, conf, entity_vector in facts:
-
-            if conf < 0.7:
-
-                continue
-
-            new_vector = np.array(entity_vector)
-
-            add_fact = True
-
-            for existing_vector in existing_vectors:
-
-                similarity = np.dot(new_vector, existing_vector) / (np.linalg.norm(new_vector) * np.linalg.norm(existing_vector))
-
-                if similarity > 0.9:
-
-                    add_fact = False
-
-                    logger.info(f"Fact for {new_entity} too similar to existing, skipping")
-
-                    break
-
-            if add_fact:
-
-                metta_fact = f'(fact "{new_entity}" "{fact}")'
-
-                runner.run(f'!(learn-fact "{new_entity}" "{fact}")')
-
-                das.add_atom(f"fact:{new_entity}:{uuid.uuid4()}", fact)
-
-                das.add_atom(f"entity_vector:{new_entity}:{uuid.uuid4()}", entity_vector)
-
-                logger.info(f"Added fact: {metta_fact}")
-
-        vectorize_graph()
-
-        logger.info(f"Continual learning: Added facts for {entity}")
-
-    except Exception as e:
-
-        logger.error(f"Continual learning failed for {entity}: {e}")
-
-        runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
-
- 
-
-# Real Web Search
-
+# Web Search
 def web_search(query: str) -> str:
-
     try:
-
         with DDGS() as ddgs:
-
             results = ddgs.text(query, max_results=5)
-
             if not results:
-
                 logger.info(f"No web results found for query: {query}")
-
                 return "No web results found."
-
             snippets = [result['body'] for result in results if 'body' in result]
-
             combined = ' '.join(snippets[:3])
-
             logger.info(f"Web search for '{query}' returned {len(snippets)} snippets")
-
             return combined if combined else "No web results found."
-
     except Exception as e:
-
         logger.error(f"Web search failed for '{query}': {e}")
-
         runner.run(f'(add-atom (error "Web Search" "{str(e)}"))')
-
         return "No web results found."
 
- 
+# Benchmarking
 
-# Dynamic Benchmarking
+logger = logging.getLogger(__name__)
 
-def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str, current_response: str) -> float:
-
+def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str, current_response: str, neural_extractor=None) -> float:
+    """
+    Benchmark VQA performance using MeTTa facts and a specific question.
+    
+    Args:
+        runner: MeTTa instance for querying facts.
+        question: The specific question to evaluate (e.g., "Who is Uhuru Kenyatta").
+        ground_truth: The expected answer for the question.
+        current_response: The model's response to the question.
+        neural_extractor: Optional NeuralExtractor instance for tokenizer access.
+    
+    Returns:
+        float: Accuracy percentage.
+    """
     try:
-
+        # Query MeTTa for facts
         facts = runner.run('!(match &self (fact $entity $fact) $fact)') or []
-
-        dataset = [{'question': f"Who is {entity}?", 'answer': fact} for entity, fact in
-
-                   [(str(f).split()[1], str(f).split('"', 2)[-1].rstrip('")')) for f in facts if len(str(f).split()) > 1]]
-
-        dataset.extend([
-
-            {'question': 'What is E=mc2?', 'answer': 'Einstein’s equation'},
-
-            {'question': 'Who is the president of Kenya?', 'answer': 'William Ruto'}
-
-        ])
-
+        # Construct dataset from MeTTa facts
+        dataset: List[Dict[str, str]] = [
+            {'question': f"Who is {entity}?", 'answer': fact}
+            for entity, fact in [
+                (str(f).split()[1], str(f).split('"', 2)[-1].rstrip('")'))
+                for f in facts if len(str(f).split()) > 1
+            ]
+        ]
         correct = 0
-
-        total = len(dataset) + 1
-
+        total = len(dataset) + 1  # Include the input question
+        
+        # Evaluate dataset questions
         for item in dataset:
-
             if item['question'] not in mock_responses:
-
                 try:
-
-                    mock_responses[item['question']] = safe_invoke(chain, {"question": item['question']}) if llm_enabled else query_metta_dynamic(item['question']) + "nLLM disabled."
-
+                    if llm_enabled:
+                        # Assuming chain is a langchain pipeline
+                        mock_responses[item['question']] = safe_invoke(chain, {"question": item['question']})
+                    else:
+                        # Fallback to MeTTa reasoning
+                        mock_responses[item['question']] = query_metta_dynamic(item['question'], neural_extractor=neural_extractor) + "\nLLM disabled."
                 except Exception as e:
-
-                    logger.error(f"Benchmark query failed: {e}")
-
+                    logger.error(f"Benchmark query failed for {item['question']}: {e}")
                     mock_responses[item['question']] = "Error in response"
-
                     runner.run(f'(add-atom (error "Benchmark Query" "{str(e)}"))')
-
             response = mock_responses[item['question']]
-
+            # Case-insensitive comparison
             if item['answer'].lower() in response.lower():
-
                 correct += 1
-
+        
+        # Evaluate the input question using current_response
         if ground_truth.lower() in current_response.lower():
-
             correct += 1
-
+        else:
+            logger.debug(f"Input question failed: question={question}, ground_truth={ground_truth}, current_response={current_response}")
+        
         accuracy = correct / total * 100
-
         logger.info(f"CLEVR/VQA Accuracy: {accuracy:.2f}%")
-
         return accuracy
-
     except Exception as e:
-
         logger.error(f"Benchmarking failed: {e}")
-
         runner.run(f'(add-atom (error "Benchmark" "{str(e)}"))')
-
         return 0.0
-
- 
-
-# SQLite-based Playground Storage
-
+# SQLite Storage
 def save_to_playground(question: str, output: str, history: list, accuracies: dict):
-
     try:
-
         conn = sqlite3.connect('playground.db')
-
         cursor = conn.cursor()
-
         cursor.execute('''CREATE TABLE IF NOT EXISTS playground (
-
             id TEXT PRIMARY KEY,
-
             question TEXT,
-
             output TEXT,
-
             history TEXT,
-
             accuracies TEXT,
-
             timestamp TEXT
-
         )''')
-
         data = {
-
             'id': str(uuid.uuid4()),
-
             'question': question,
-
             'output': output,
-
             'history': json.dumps(history),
-
             'accuracies': json.dumps(accuracies),
-
             'timestamp': logging.Formatter().formatTime(logging.makeLogRecord({}))
-
         }
-
         cursor.execute('''INSERT INTO playground (id, question, output, history, accuracies, timestamp)
-
                          VALUES (:id, :question, :output, :history, :accuracies, :timestamp)''', data)
-
         conn.commit()
-
         conn.close()
-
         logger.info("Saved to SQLite playground.db")
-
     except sqlite3.Error as e:
-
         logger.error(f"SQLite save failed: {e}")
-
         runner.run(f'(add-atom (error "SQLite Save" "{str(e)}"))')
-
         with open('playground_output.json', 'w') as f:
-
             json.dump(data, f, indent=2)
-
         logger.info("Fallback: Saved to playground_output.json")
 
- 
-
-# Autonomous goal setting
-
-def autonomous_goal_setting():
-
-    while True:
-
-        time.sleep(30)
-
-        goals = runner.run('!(match &self (goal $g) $g)')
-
-        if goals:
-
-            goal = goals[0]
-
-            if "Learn about" in goal:
-
-                entity = goal.split("Learn about")[-1].strip()
-
-                continual_learning(entity)
-
-                logger.info(f"Autonomous learning goal executed for {entity}")
-
-            elif "Reflect on" in goal:
-
-                interactions = das.query("interaction:*")
-
-                for inter in interactions[-5:]:
-
-                    runner.run(f'!(reflect "{inter}" 0.6)')
-
-                logger.info("Self-reflection goal executed")
-
-        else:
-
-            runner.run('(set-goal "Learn about William Ruto")')
-
-            logger.info("Default goal set")
-
- 
-
-# Memory storage
-
+# Memory Storage
 def store_memory(question: str, response: str, confidence: float = 0.85):
-
     inter_id = str(uuid.uuid4())
-
     das.add_atom(f"interaction:{inter_id}", f"Query: {question} Response: {response} Confidence: {confidence}")
+    
+def continual_learning(entity: str):
+    try:
+        entity = entity.lower().replace(" ", "-").replace("--", "-")
+        logger.debug(f"Normalized entity for continual learning: {entity}")
+        if entity == "obama":
+            web_result = (
+                "Barack Hussein Obama II (born August 4, 1961) is an American politician who was the 44th president of the United States from 2009 to 2017. "
+                "A member of the Democratic Party, he was the first African American president. Obama previously served as a U.S. senator representing Illinois "
+                "from 2005 to 2008 and as an Illinois state senator from 1997 to 2004."
+            )
+        else:
+            web_result = web_search(f"Who is {entity}?")
+        if not web_result or "No web results found" in web_result:
+            logger.info(f"No web results for {entity}, skipping continual learning")
+            return
+        logger.debug(f"Web result for {entity}: {web_result[:100]}...")
+        facts = extract_facts_lightweight(web_result)
+        logger.debug(f"Extracted facts for {entity}: {facts}")
+        existing_facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
+        device = torch.device('cpu')  # Force cpu
+        query_emb = embedder.encode(f"learn-fact {entity}")
+        query_emb = torch.tensor(query_emb, dtype=torch.float).to(device)
+        data, _ = build_graph(query_emb)  # Ensure build_graph returns cpu tensors
+        # Move all graph data to cpu
+        data = data.to(device)
+        rule = None
+        rule_confidence = 0.6
+        if data.x.size(0) > 0:
+            pattern_gnn.eval()
+            pattern_gnn.to(device)  # Ensure model is on cpu
+            with torch.no_grad():
+                out = pattern_gnn(data)
+                rule_confidence = min(out.mean().item(), 0.9)
+            if rule_confidence >= 0.7 and facts:
+                rule = f"(= (implies (fact \"{entity}\" \"{facts[0][1]}\") (role \"{entity}\" leader)) true)"
+        if not rule and llm_enabled:
+            rule_prompt = ChatPromptTemplate.from_template("""
+            Generate a MeTTa rule for the entity based on facts.
+            Entity: {entity}
+            Facts: {facts}
+            Output: "<MeTTa rule>"
+            """)
+            try:
+                rule = (rule_prompt | llm | parser).invoke({"entity": entity, "facts": facts})
+                pattern_dataset.append({
+                    "query_emb": query_emb.tolist(),
+                    "context_emb": embedder.encode(str(existing_facts)).tolist(),
+                    "heuristic": rule,
+                    "confidence": 0.9
+                })
+                train_pattern_gnn()  # Ensure train_pattern_gnn uses cpu
+            except Exception as e:
+                logger.error(f"LLM rule generation failed for {entity}: {e}")
+                runner.run(f'(add-atom (error "LLM Rule" "{str(e)}"))')
+                rule = bert_fallback_rule(entity, facts, existing_facts)
+        elif not rule:
+            logger.info(f"LLM disabled, using BERT-based fallback for rule selection on entity: {entity}")
+            rule = bert_fallback_rule(entity, facts, existing_facts)
+            rule_confidence = 0.75
+        if rule:
+            runner.run(rule)
+            das.add_atom(f"rule:{entity}:{uuid.uuid4()}", rule)
+            logger.info(f"Induced rule: {rule} (Confidence: {rule_confidence})")
+        if not facts:
+            logger.info(f"No facts extracted for {entity}, skipping fact addition")
+            return
+        for _, fact, conf, entity_vector in facts:
+            if conf >= 0.7:
+                try:
+                    runner.run(f'!(learn-fact "{entity}" "{fact}")')
+                    fact_id = uuid.uuid4()
+                    das.add_atom(f"fact:{entity}:{fact_id}", fact)
+                    das.add_atom(f"entity_vector:{entity}:{fact_id}", entity_vector)
+                    runner.run(f'(add-atom (new-atom "{entity}"))')
+                    logger.info(f"Added fact to DAS: fact:{entity}:{fact_id}, value='{fact}'")
+                except Exception as e:
+                    logger.error(f"Failed to add fact for {entity}: {e}")
+                    runner.run(f'(add-atom (error "Fact Addition" "{str(e)}"))')
+                    continue
+        vectorize_graph()  # Ensure vectorize_graph uses cpu
+        logger.info(f"Continual learning: Processed facts for {entity}")
+    except Exception as e:
+        logger.error(f"Continual learning failed for {entity}: {e}")
+        runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')        
+        # New helper function for BERT fallback rule
+def bert_fallback_rule(entity: str, facts: List[tuple], existing_facts: list) -> str:
+    context_text = f"Entity: {entity} Facts: {facts} Existing: {existing_facts}"
+    
+    # Pre-defined rule templates
+    rule_templates = [
+        "(= (implies (fact \"{entity}\" \"{fact}\") (role \"{entity}\" leader)) true)",
+        "(= (implies (fact \"{entity}\" \"{fact}\") (role \"{entity}\" politician)) true)",
+        "(= (implies (fact \"{entity}\" \"{fact}\") (role \"{entity}\" entity)) true)",  # Default
+    ]
+    
+    # Format with first fact if available
+    fact = facts[0][1] if facts else "unknown"
+    formatted_templates = [t.format(entity=entity, fact=fact) for t in rule_templates]
+    
+    # Compute similarities
+    similarities = [neural_extractor.compute_similarity(context_text, templ) for templ in formatted_templates]
+    max_sim_idx = np.argmax(similarities)
+    best_rule = formatted_templates[max_sim_idx]
+    confidence = similarities[max_sim_idx]
+    
+    if confidence < 0.7:
+        best_rule = rule_templates[-1].format(entity=entity, fact=fact)
+    
+    return best_rule
 
- 
 
-# Cross-domain transfer
 
-def cross_domain_transfer(domain1: str, domain2: str, pattern: str):
+# Autonomous Goal Setting
+def autonomous_goal_setting():
+    while True:
+        time.sleep(300)
+        goals = runner.run('!(match &self (goal $g) $g)')
+        interactions = das.query("interaction:*")[-5:] or ["No recent interactions"]
+        if not goals and llm_enabled:
+            goal_prompt = ChatPromptTemplate.from_template("""
+            Suggest a learning goal based on recent interactions...
+            Return: "Learn about <entity>"
+            """)
+            new_goal = (goal_prompt | llm | parser).invoke({"interactions": interactions})
+            runner.run(f'(set-goal "{new_goal}")')
+            logger.info(f"Dynamic goal set: {new_goal}")
+        if goals:
+            goal = goals[0]
+            if "Learn about" in goal:
+                entity = goal.split("Learn about")[-1].strip()
+                continual_learning(entity)
+        train_pattern_gnn()
+        review_heuristics(manual=False)
 
-    runner.run(f'(transfer-pattern {domain1} {domain2} "{pattern}")')
-
-    logger.info(f"Transferred pattern from {domain1} to {domain2}")
-
- 
-
-# Retry decorator
-
+# Retry Decorator
 @retry(wait=wait_random_exponential(min=10, max=120), stop=stop_after_attempt(10))
-
 def safe_invoke(chain, input_dict):
-
-    return chain.invoke(input_dict)
-
-
+    try:
+        logger.info(f"Attempting LLM invocation for input: {input_dict}")
+        return chain.invoke(input_dict)
+    except Exception as e:
+        logger.error(f"LLM invocation failed after retries: {e}")
+        runner.run(f'(add-atom (error "LLM Invoke" "{str(e)}"))')
+        return f"LLM unavailable: {str(e)}. Falling back to MeTTa reasoning."
 
 import gradio as gr
 import pandas as pd
+from datetime import datetime
 
-# --- Utility: make Markdown table from list of rows ---
-def to_markdown_table(data, headers):
-    if not data:
-        return "No results found."
-    df = pd.DataFrame(data, columns=headers)
-    return df.to_markdown(index=False)
-
-# --- Debug functions ---
-def debug_facts():
-    results = runner.run("!(all (fact $x))") or []
-    return to_markdown_table([[r] for r in results], ["Facts"])
-
-def debug_faiss(prompt="example"):
-    neighbors = faiss_client.search(prompt, k=5) if faiss_client else []
-    return to_markdown_table([[n] for n in neighbors], ["Nearest Atoms"])
-
-def debug_errors():
-    errors = runner.run("!(get-errors $type)") or []
-    return to_markdown_table([[e] for e in errors], ["Recent Errors"])
-
-def debug_domain():
-    entities = runner.run("!(select-domain $x)") or []
-    return to_markdown_table([[e] for e in entities], ["Domain Entities"])
-
-# --- Chatbot logic (same as before) ---
-def chatbot_interface(user_input, history=[]):
-    if user_input.lower() == "exit":
-        return history + [
-            {"role": "user", "content": user_input},
-            {"role": "assistant", "content": "Session ended."},
-        ]
-
-    if user_input.lower() == "errors":
-        errors = runner.run("!(get-errors $type)") or ["No recent errors"]
-        return history + [
-            {"role": "user", "content": user_input},
-            {"role": "assistant", "content": "Recent Errors: " + ", ".join(errors)},
-        ]
-
-    if user_input.lower().startswith("update"):
-        parts = user_input[6:].strip().split(" ", 1)
-        domain = parts[0] if len(parts) > 1 else "General"
-        new_fact = parts[1] if len(parts) > 1 else ""
-        update_graph(domain, new_fact)
-        return history + [
-            {"role": "user", "content": user_input},
-            {"role": "assistant", "content": "Knowledge graph updated."},
-        ]
-
-    # Normal question
-    try:
-        if llm_enabled:
-            response = safe_invoke(chain, {"question": user_input})
+# Function to format chat history for Gradio
+def format_chat_history(history):
+    chat_display = []
+    for entry in history:
+        if isinstance(entry, str) and entry.startswith("Updated"):
+            chat_display.append([None, f"System: {entry}"])
         else:
-            response = query_metta_dynamic(user_input) + "\nLLM disabled due to invalid API key."
-    except Exception as e:
-        logger.error(f"LLM invocation failed in Gradio: {e}")
-        response = "Sorry, I couldn't process that request."
+            try:
+                entry_data = json.loads(entry) if isinstance(entry, str) else entry
+                question = entry_data.get("question", "Unknown")
+                response = entry_data.get("output", "No response")
+                # Ensure format is [question, response] for Gradio Chatbot
+                chat_display.append([question, f"{response}\nConfidence: {entry_data.get('confidence', 0.85):.2f}\nTimestamp: {entry_data.get('timestamp', 'Unknown')}"])
+            except (json.JSONDecodeError, AttributeError):
+                chat_display.append([None, f"System: Invalid history entry: {entry}"])
+    return chat_display
 
-    confidence = 0.85
-    store_memory(user_input, response, confidence)
-
-    history.append({"role": "user", "content": user_input})
-    history.append({"role": "assistant", "content": response})
-
-    # Continual learning
-    if "who is" in user_input.lower() or "what is" in user_input.lower():
-        entity = (
-            user_input.split("Who is")[-1].strip().rstrip("?")
-            if "Who is" in user_input
-            else user_input.split("What is")[-1].strip().rstrip("?")
-        )
-        if entity:
-            continual_learning(entity)
-
-    return history
-
-
-# --- Gradio UI setup ---
-with gr.Blocks() as demo:
-    with gr.Tab("Chat"):
-        gr.Markdown("# 🤖 General FAQ Chatbot with MeTTa + FAISS + Redis")
-
-        chatbot = gr.Chatbot(label="Chatbot", height=500, type="messages")
-        msg = gr.Textbox(label="Your question", placeholder="Ask me something...")
-        clear = gr.Button("Clear Chat")
-
-        def respond(user_input, history):
-            return chatbot_interface(user_input, history)
-
-        msg.submit(respond, [msg, chatbot], chatbot)
-        clear.click(lambda: [], None, chatbot)
-
-    with gr.Tab("Debug"):
-        gr.Markdown("## 🔍 Debugging Tools")
-
-        with gr.Row():
-            fact_btn = gr.Button("Show Facts")
-            faiss_btn = gr.Button("FAISS Neighbors")
-            error_btn = gr.Button("Recent Errors")
-            domain_btn = gr.Button("Domain Entities")
-
-        debug_output = gr.Markdown()
-
-        fact_btn.click(fn=debug_facts, outputs=debug_output)
-        faiss_btn.click(fn=debug_faiss, outputs=debug_output)
-        error_btn.click(fn=debug_errors, outputs=debug_output)
-        domain_btn.click(fn=debug_domain, outputs=debug_output)
-
-
-# --- Run Gradio app ---
-if __name__ == "__main__":
-    demo.launch()
-
-
-import threading
-import time
-from hyperon import *
-from hyperon import GroundingSpace
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
-import logging
-import uuid
-import json
-from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-from datasets import Dataset
-
-# Setup logging 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Initialize MeTTa and GroundingSpace
-space = GroundingSpace()
-runner = MeTTa(space=space.space, cname=True)
-
-# Vectorization: SentenceTransformer for embedding atoms
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-# FAISS for vector search (modular, scalable)
-dimension = 384  # MiniLM embedding size
-index = faiss.IndexFlatL2(dimension)
-atom_vectors = {}  # {atom_id: atom_text}
-
-# DAS Setup 
-class DASClient:
-    def __init__(self, host='localhost', port=6379):
-        try:
-            self.redis = redis.Redis(host=host, port=port, decode_responses=True)
-            logger.info("DAS client initialized with Redis backend")
-        except Exception as e:
-            logger.error(f"DAS initialization failed: {e}")
-            sys.exit(1)
-
-    def add_atom(self, atom: str, value: Any):
-        try:
-            self.redis.set(atom, str(value))
-            logger.info(f"Added atom {atom} to DAS")
-        except Exception as e:
-            logger.error(f"DAS add_atom failed: {e}")
-
-    def query(self, pattern: str) -> List[str]:
-        try:
-            keys = self.redis.keys(f"{pattern}*")
-            results = [self.redis.get(key) for key in keys]
-            logger.info(f"DAS query returned {len(results)} results")
-            return results
-        except Exception as e:
-            logger.error(f"DAS query failed: {e}")
-            return []
-
-das = DASClient()
-
-# Load initial general knowledge graph in MeTTa
-knowledge_metta = """
-(: General Domain)
-(: Person Type)
-(: Role Type)
-(: Entity Type)
-
-; Modular domain example
-(: Kenyan-Politics Domain)
-(add-atom (in-domain Uhuru-Kenyatta Kenyan-Politics) true)
-(: Science Domain)
-
-; General inference rules
-(= (definition Person) "A human individual with roles and relationships.")
-(= (example Person) "Example: Individuals like Uhuru Kenyatta.")
-(= (definition Role) "A position or function, e.g., President.")
-(= (example Role) "Example: President of a country.")
-
-; Dynamic relationship extraction
-(= (get-roles $entity)
-   (match &self (role $entity $r) $r))
-
-(= (get-relations $entity $type)
-   (match &self ($type $entity $other) ($type $other)))
-
-; Reverse inference
-(= (son-of $x $y) (father-of $y $x))
-
-; Domain selection
-(= (select-domain $domain)
-   (match &self (in-domain $entity $domain) $entity))
-
-; Self-reflection rule
-(= (reflect $interaction $confidence)
-   (if (< $confidence 0.7)
-      (refine-rule $interaction)
-      "No refinement needed"))
-
-; Refine strategy
-(= (refine-rule $interaction)
-   (add-atom (improved-rule $interaction "Refined")))
-
-; Cross-domain transfer
-(= (transfer-pattern $domain1 $domain2 $pattern)
-   (match &self (pattern $domain1 $pattern)
-      (add-atom (pattern $domain2 $pattern))))
-
-; Goal setting
-(= (set-goal $goal)
-   (add-atom (goal $goal)))
-
-; Continual learning rule
-(= (learn-fact $entity $fact)
-   (add-atom (fact $entity $fact)))
-"""
-runner.run(knowledge_metta)
-logger.info("Initial knowledge graph loaded.")
-
-# Vectorize atoms and store in FAISS/DAS
-def vectorize_graph():
-    global index, atom_vectors
-    atoms = runner.run('!(match &self $atom $atom)') or []
-    index = faiss.IndexFlatL2(dimension)
-    atom_vectors = {}
-    vectors = []
-    for atom in atoms:
-        atom_text = str(atom)
-        embedding = embedder.encode(atom_text)
-        atom_id = str(uuid.uuid4())
-        atom_vectors[atom_id] = atom_text
-        vectors.append(embedding)
-        das.add_atom(f"embedding:{atom_id}", embedding.tolist())
-    if vectors:
-        index.add(np.array(vectors))
-    logger.info("Knowledge graph vectorized.")
-
-vectorize_graph()
-
-# Neural Extractor for continual learning 
-class NeuralExtractor:
-    def __init__(self):
-        try:
-            self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-            self.model = BertModel.from_pretrained('bert-base-uncased')
-            self.classifier = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
-            self.fine_tune()
-            logger.info("BERT models initialized and fine-tuned")
-        except Exception as e:
-            logger.error(f"BERT initialization failed: {e}")
-            sys.exit(1)
-
-    def fine_tune(self):
-        data = {
-            'text': [
-                "Uhuru Kenyatta is president of Kenya.",
-                "Jomo Kenyatta is father of Uhuru Kenyatta.",
-                "Kenya is a country."
-            ],
-            'label': [1, 1, 1]
-        }
-        dataset = Dataset.from_dict(data)
-        def tokenize_function(examples):
-            return self.tokenizer(examples['text'], padding='max_length', truncation=True, max_length=128)
-        dataset = dataset.map(tokenize_function, batched=True)
-        dataset.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
-
-        training_args = TrainingArguments(
-            output_dir='./bert-finetuned',
-            num_train_epochs=3,
-            per_device_train_batch_size=8,
-            logging_dir='./logs',
-            logging_steps=10,
-        )
-        trainer = Trainer(
-            model=self.classifier,
-            args=training_args,
-            train_dataset=dataset
-        )
-        trainer.train()
-        logger.info("BERT fine-tuned for fact extraction")
-
-    def extract_facts(self, text: str) -> List[tuple]:
-        # Generate candidate facts (simplified)
-        templates = [
-            f"{text.split(' ')[-1]} is a [MASK].",
-            f"{text.split(' ')[-1]} is [MASK] of Kenya."
-        ]
-        candidate_facts = []
-        for template in templates:
-            inputs = self.tokenizer(template, return_tensors='pt')
-            outputs = self.classifier(**inputs)
-            logits = outputs.logits
-            prob = torch.softmax(logits, dim=-1)[0, 1].item()
-            mask_token = template.replace("[MASK]", self.tokenizer.decode(torch.argmax(logits, dim=-1)))
-            candidate_facts.append((text, mask_token, prob))
-        return candidate_facts
-
-neural_extractor = NeuralExtractor()
-
-# LLM Integration (LangChain with GPT-4o-mini)
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-prompt = ChatPromptTemplate.from_template("""
-You are a general FAQ chatbot. Use the following context from the knowledge graph to answer the question.
-Context: {context}
-
-Question: {question}
-
-Provide a structured answer with definitions, examples, and references. If unsure, suggest updates.
-""")
-
-parser = StrOutputParser()
-
-chain = {
-    "context": lambda x: query_metta_dynamic(x["question"]),
-    "question": RunnablePassthrough()
-} | prompt | llm | parser
-
-# Dynamic MeTTa query with vector search
-def query_metta_dynamic(question: str) -> str:
+# Function to export chat history to CSV
+def export_chat_to_csv():
     try:
-        query_emb = embedder.encode(question)
-        _, indices = index.search(np.array([query_emb]), k=5)
-        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
-        entity = question.split("Who is")[-1].strip().rstrip('?') if "Who is" in question else question.split()[-1].rstrip('?')
-        domains = runner.run(f'!(match &self (in-domain {entity} $d) $d)') or ["General"]
-        domain = domains[0] if domains else "General"
-        faqs = runner.run(f'!(get-faq "{question}" {domain})') or ["No FAQ"]
-        roles = runner.run(f'!(get-roles {entity})') or ["Unknown"]
-        relations = runner.run(f'!(get-relations {entity} father-of)') or ["None"]
-        definition = runner.run(f'!(definition {entity})') or runner.run('!(definition Person)') or ["No definition"]
-        example = runner.run(f'!(example {entity})') or runner.run('!(example Person)') or ["No example"]
-        context = (
-            f"Domain: {domain}\n"
-            f"FAQ: {question} → {faqs[0]}\n"
-            f"Similar facts: {similar_atoms}\n"
-            f"Roles: {roles}\n"
-            f"Relations: {relations}\n"
-            f"Definition: {definition}\n"
-            f"Example: {example}"
-        )
-        logger.info(f"Dynamic MeTTa query result: {context}")
-        return context
+        conn = sqlite3.connect('playground.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT question, output, confidence, timestamp FROM playground")
+        rows = cursor.fetchall()
+        conn.close()
+        df = pd.DataFrame(rows, columns=["Question", "Response", "Confidence", "Timestamp"])
+        csv_path = f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Exported chat history to {csv_path}")
+        return csv_path
+    except sqlite3.Error as e:
+        logger.error(f"CSV export failed: {e}")
+        runner.run(f'(add-atom (error "CSV Export" "{str(e)}"))')
+        return None
+def parse_natural_language_update(update_text: str) -> tuple:
+    """
+    Parse natural language update to extract domain and fact.
+    Tries LLM first, then BERT, then rule-based parsing.
+    Returns: (domain, fact) or (None, None) if parsing fails.
+    """
+    try:
+        # Default domain if not specified
+        default_domain = "General"
+        fact = update_text.strip()
+        
+        # Try LLM first if enabled
+        if llm_enabled:
+            try:
+                parse_prompt = ChatPromptTemplate.from_template("""
+                Parse the following input to extract a domain and fact for a knowledge graph update.
+                Input: {input}
+                Return in JSON format:
+                {
+                  "domain": "<domain>",
+                  "fact": "<MeTTa fact like (fact \"entity\" \"fact\")>",
+                  "confidence": <float>
+                }
+                If the input is invalid, return {"domain": null, "fact": null, "confidence": 0.0}.
+                Valid domains: General, Kenyan-Politics, Science.
+                Example input: "Kenyan-Politics: Uhuru Kenyatta is a former president."
+                Example output: {"domain": "Kenyan-Politics", "fact": "(fact \"uhuru-kenyatta\" \"a former president\")", "confidence": 0.9}
+                """)
+                result = json.loads((parse_prompt | llm | parser).invoke({"input": update_text}))
+                if result["domain"] and result["fact"] and result["confidence"] >= 0.7:
+                    logger.info(f"LLM-parsed update: domain='{result['domain']}', fact='{result['fact']}', confidence={result['confidence']:.2f}")
+                    return result["domain"], result["fact"]
+                else:
+                    logger.debug(f"LLM rejected update (low confidence or invalid): {result}")
+                    # Fall through to BERT
+            except Exception as e:
+                logger.error(f"LLM parsing failed for update '{update_text}': {e}")
+                runner.run(f'(add-atom (error "LLM Update Parse" "{str(e)}"))')
+        
+        # BERT-based fallback
+        if neural_extractor.classifier is not None and neural_extractor.model is not None:
+            prob = neural_extractor.classify_sentence(update_text)
+            if prob < 0.7:
+                logger.debug(f"BERT rejected update as non-fact (prob={prob:.2f}): '{update_text}'")
+                runner.run(f'(add-atom (error "BERT Update Parse" "Input not a valid fact: {update_text}"))')
+                # Fall through to rule-based
+            else:
+                # Extract entity and fact
+                if " is " in update_text.lower():
+                    parts = update_text.split(" is ", 1)
+                    if len(parts) != 2 or not all(parts):
+                        logger.debug(f"Invalid fact structure in BERT parsing: '{update_text}'")
+                        runner.run(f'(add-atom (error "BERT Update Parse" "Invalid fact structure: {update_text}"))')
+                        return None, None
+                    entity, fact = parts
+                    entity = entity.split('(')[0].split(',')[0].strip().lower().replace(" ", "-").replace("--", "-")
+                    fact = fact.strip()
+                    
+                    # Detect domain
+                    domain = default_domain
+                    if ":" in update_text:
+                        potential_domain = update_text.split(":")[0].strip().title()
+                        if potential_domain in ["General", "Kenyan-Politics", "Science"]:
+                            domain = potential_domain
+                    elif " in " in update_text.lower():
+                        domain = update_text.lower().split(" in ")[-1].split(" ")[0].title()
+                    elif "about" in update_text.lower():
+                        domain = update_text.lower().split("about")[-1].split(" ")[0].title()
+                    
+                    metta_fact = f'(fact "{entity}" "{fact}")'
+                    logger.info(f"BERT-parsed update: domain='{domain}', fact='{metta_fact}', prob={prob:.2f}")
+                    return domain, metta_fact
+        
+        # Rule-based fallback
+        logger.info(f"BERT unavailable, using rule-based parsing for update: '{update_text}'")
+        domain = default_domain
+        if ":" in update_text:
+            parts = update_text.split(":", 1)
+            if len(parts) == 2:
+                domain = parts[0].strip().title()
+                fact = parts[1].strip()
+        elif " in " in update_text.lower():
+            parts = update_text.split(" in ", 1)
+            if len(parts) == 2:
+                fact = parts[0].strip()
+                domain = parts[1].strip().title()
+        elif "about" in update_text.lower():
+            parts = update_text.split("about", 1)
+            if len(parts) == 2:
+                fact = parts[0].strip()
+                domain = parts[1].strip().title()
+        else:
+            fact = update_text
+        
+        if not fact or " is " not in fact.lower():
+            logger.debug(f"Invalid fact in rule-based parsing: '{update_text}'")
+            runner.run(f'(add-atom (error "Rule-Based Update Parse" "Invalid fact format: {update_text}"))')
+            return None, None
+        
+        parts = fact.split(" is ", 1)
+        if len(parts) != 2 or not all(parts):
+            logger.debug(f"Invalid fact structure in rule-based parsing: '{update_text}'")
+            runner.run(f'(add-atom (error "Rule-Based Update Parse" "Invalid fact structure: {update_text}"))')
+            return None, None
+        entity = parts[0].split('(')[0].split(',')[0].strip().lower().replace(" ", "-").replace("--", "-")
+        metta_fact = f'(fact "{entity}" "{parts[1].strip()}")'
+        
+        logger.info(f"Rule-based parsed update: domain='{domain}', fact='{metta_fact}'")
+        return domain, metta_fact
+    
     except Exception as e:
-        logger.error(f"Dynamic MeTTa query failed: {e}")
-        return "Error querying knowledge graph."
+        logger.error(f"Failed to parse update '{update_text}': {e}")
+        runner.run(f'(add-atom (error "Update Parse" "{str(e)}"))')
+        return None, None
+    
+# Modified run_chatbot with Gradio interface
+def run_chatbot():
+    def format_chat_history(history):
+        return [{'role': msg['role'], 'content': msg['content']} for msg in history]
 
-# Update knowledge graph (user-fed data, modular)
+    def process_input(question, faq_update, history):
+        if not question and not faq_update:
+            return history, "Please enter a question or an FAQ update.", None
+        history = history or []
+
+        # Handle FAQ update
+        if faq_update:
+            domain, fact = parse_natural_language_update(faq_update)
+            if domain and fact:
+                update_graph(domain, fact)
+                update_msg = f"Updated {domain}: {fact}"
+                history.append({'role': 'user', 'content': f"FAQ Update: {faq_update}"})
+                history.append({'role': 'assistant', 'content': update_msg, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+                logger.info(f"Processed FAQ update: {update_msg}")
+                return format_chat_history(history), update_msg, None
+            else:
+                error_msg = f"Failed to parse FAQ update: '{faq_update}'. Use format like 'Kenyan-Politics: Uhuru Kenyatta is a former president.'"
+                history.append({'role': 'user', 'content': f"FAQ Update: {faq_update}"})
+                history.append({'role': 'assistant', 'content': error_msg, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+                return format_chat_history(history), error_msg, None
+
+        # Normalize query for "Who" questions
+        normalized_question = question
+        if question.lower().startswith("who ") and " is " not in question.lower():
+            normalized_question = question.replace("Who ", "Who is ", 1)
+            logger.info(f"Normalized query: '{question}' to '{normalized_question}'")
+        question = normalized_question
+
+        if question.lower() == 'errors':
+            errors = runner.run('!(get-errors $type)') or ["No recent errors"]
+            history.append({'role': 'user', 'content': question})
+            history.append({'role': 'assistant', 'content': f"Recent Errors: {errors}", 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            return format_chat_history(history), f"Recent Errors: {errors}", None
+        if question.lower() == 'review heuristics':
+            review_result = review_heuristics(manual=True)
+            history.append({'role': 'user', 'content': question})
+            history.append({'role': 'assistant', 'content': review_result, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            return format_chat_history(history), review_result, None
+        if question.lower().startswith('update'):
+            parts = question[6:].strip().split(' ', 1)
+            domain = parts[0] if len(parts) > 1 else "General"
+            new_fact = parts[1] if len(parts) > 1 else ""
+            update_graph(domain, new_fact)
+            update_msg = f"Updated {domain}: {new_fact}"
+            history.append({'role': 'user', 'content': question})
+            history.append({'role': 'assistant', 'content': update_msg, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            return format_chat_history(history), update_msg, None
+        try:
+            if llm_enabled:
+                response = safe_invoke(chain, {"question": question})
+            else:
+                logger.warning("LLM disabled, falling back to MeTTa reasoning")
+                response = query_metta_dynamic(question) + "\nNote: LLM is disabled due to API quota issues."
+        except Exception as e:
+            logger.error(f"Query processing failed for '{question}': {e}")
+            runner.run(f'(add-atom (error "Query Processing" "{str(e)}"))')
+            response = f"Sorry, I couldn't process that request due to an internal error: {str(e)}"
+        confidence = 0.85
+        store_memory(question, response, confidence)
+        history.append({'role': 'user', 'content': question})
+        history.append({'role': 'assistant', 'content': response, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+        accuracy = benchmark_clevr_vqa(runner, question, "Unknown", response)
+        save_to_playground(question, response, history, {'clevr_vqa': accuracy})
+        if "who is" in question.lower() or "what is" in question.lower():
+            entity = (question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-") if "who is" in question.lower() else
+                      question.lower().split("what is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-"))
+            if entity:
+                logger.info(f"Extracted entity for continual learning: {entity}")
+                try:
+                    continual_learning(entity)
+                except Exception as e:
+                    logger.error(f"Continual learning failed for {entity}: {e}")
+                    runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
+                    response += f"\nFailed to learn facts for {entity}: {str(e)}"
+                    history[-1]['content'] = response
+        return format_chat_history(history), response, None
+
+    def launch_gradio():
+        server_name = os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")
+        server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+        max_attempts = 20
+        for port in range(server_port, server_port + max_attempts):
+            try:
+                with gr.Blocks(title="General FAQ Chatbot") as interface:
+                    gr.Markdown("""
+                    # General FAQ Chatbot
+                    Ask questions, update FAQs with natural language (e.g., 'Kenyan-Politics: Uhuru Kenyatta is a former president.' or 'Add to Science: Gravity is a force.'), review heuristics with `review heuristics`, or check errors with `errors`.  
+                    Note: LLM is disabled due to OpenAI API quota issues. Using MeTTa reasoning and BERT-based fallbacks.  
+                    Note: Redis is required for persistent storage. Install with: `sudo apt-get install redis-server` (Ubuntu) or `brew install redis` (macOS).
+                    """)
+                    chatbot = gr.Chatbot(label="Chat History", height=400, type="messages")
+                    question_input = gr.Textbox(label="Ask a question", placeholder="Type your question here (e.g., 'Who is Uhuru Kenyatta?')")
+                    faq_update_input = gr.Textbox(label="Update FAQ", placeholder="Enter FAQ update (e.g., 'Kenyan-Politics: Uhuru Kenyatta is a former president.')")
+                    submit_button = gr.Button("Submit Question")
+                    faq_submit_button = gr.Button("Submit FAQ Update")
+                    csv_button = gr.Button("Export Chat History as CSV")
+                    csv_output = gr.File(label="Download CSV")
+
+                    submit_button.click(
+                        fn=process_input,
+                        inputs=[question_input, faq_update_input, chatbot],
+                        outputs=[chatbot, gr.Textbox(label="Response"), csv_output]
+                    )
+                    faq_submit_button.click(
+                        fn=process_input,
+                        inputs=[question_input, faq_update_input, chatbot],
+                        outputs=[chatbot, gr.Textbox(label="Response"), csv_output]
+                    )
+                    csv_button.click(
+                        fn=export_chat_to_csv,
+                        inputs=None,
+                        outputs=csv_output
+                    )
+                    logger.info(f"Attempting to launch Gradio on port {port}")
+                    interface.launch(server_name=server_name, server_port=port, share=False)
+                    logger.info(f"Gradio launched successfully on http://{server_name}:{port}")
+                    return
+            except Exception as e:
+                logger.error(f"Failed to launch Gradio on port {port}: {e}")
+                runner.run(f'(add-atom (error "Gradio Launch" "Port {port}: {str(e)}"))')
+                if "Cannot find empty port" in str(e):
+                    continue
+                else:
+                    print(f"Gradio launch failed: {e}. Check logs or try a different port range.")
+                    return
+        print(f"Failed to find an available port in range {server_port}-{server_port + max_attempts - 1}. Set GRADIO_SERVER_PORT to a free port or free up port {server_port}.")
+        runner.run(f'(add-atom (error "Gradio Launch" "No available ports in range {server_port}-{server_port + max_attempts - 1}"))')
+
+    threading.Thread(target=autonomous_goal_setting, daemon=True).start()
+    test_question = "Who is Uhuru Kenyatta"
+    history = []
+    history, response, _ = process_input(test_question, "", history)
+    print(f"Question: {test_question}\nResponse: {response}")
+    launch_gradio()
+    
+# Update Graph
 def update_graph(domain: str, new_fact: str):
     try:
         if not new_fact.startswith('(= '):
@@ -1624,135 +1535,12 @@ def update_graph(domain: str, new_fact: str):
         entity = new_fact.split()[1] if len(new_fact.split()) > 1 else "Unknown"
         runner.run(f'(add-atom (in-domain {entity} {domain}) true)')
         runner.run(new_fact)
+        runner.run(f'(add-atom (new-atom "{entity}"))')
         vectorize_graph()
         logger.info(f"Graph updated in domain {domain} with: {new_fact}")
     except Exception as e:
         logger.error(f"Graph update failed: {e}")
-
-# Autonomous goal setting and execution (narcissist/realist)
-def autonomous_goal_setting():
-    while True:
-        time.sleep(30)  # Check every 30 seconds
-        goals = runner.run('!(match &self (goal $g) $g)')
-        if goals:
-            goal = goals[0]
-            if "Learn about" in goal:
-                entity = goal.split("Learn about")[-1].strip()
-                facts = neural_extractor.extract_facts(entity)
-                for entity, fact, conf in facts:
-                    runner.run(f'!(learn-fact "{entity}" "{fact}")')
-                vectorize_graph()
-                logger.info(f"Autonomous learning goal executed for {entity}")
-            elif "Reflect on" in goal:
-                interactions = das.query("interaction:*")
-                for inter in interactions[-5:]:  # Last 5
-                    runner.run(f'!(reflect "{inter}" 0.6)')  # Mock confidence
-                logger.info("Self-reflection goal executed")
-        else:
-            # Set default goal
-            runner.run('(set-goal "Learn about Uhuru Kenyatta")')
-            logger.info("Default goal set")
-
-# Memory storage 
-def store_memory(question: str, response: str, confidence: float = 0.85):
-    inter_id = str(uuid.uuid4())
-    das.add_atom(f"interaction:{inter_id}", f"Query: {question} Response: {response} Confidence: {confidence}")
-
-# Self-reflection in MeTTa (already in knowledge_metta)
-
-# Cross-domain transfer 
-def cross_domain_transfer(domain1: str, domain2: str, pattern: str):
-    runner.run(f'(transfer-pattern {domain1} {domain2} "{pattern}")')
-    logger.info(f"Transferred pattern from {domain1} to {domain2}")
-
-# Continual learning function (narcissist/optimist)
-def continual_learning(entity: str):
-    web_result = web_search(f"Who is {entity}?")
-    facts = neural_extractor.extract_facts(web_result)
-    for entity, fact, conf in facts:
-        runner.run(f'!(learn-fact "{entity}" "{fact}")')
-    vectorize_graph()
-    logger.info(f"Continual learning: Added facts for {entity}")
-
-# Web Search Mock (enhanced for continual learning)
-def web_search(query: str) -> str:
-    mock_results = {
-        "Who is Uhuru Kenyatta?": "Uhuru Kenyatta is a Kenyan politician, fourth president of Kenya (2013–2022), son of Jomo Kenyatta.",
-        "What is E=mc2?": "Einstein’s mass-energy equivalence equation."
-    }
-    return mock_results.get(query, "No web results found.")
-
-# Benchmarking 
-def benchmark_clevr_vqa(runner: MeTTa, question: str, ground_truth: str) -> float:
-    try:
-        mock_dataset = [
-            {'question': 'Who is Uhuru Kenyatta?', 'answer': 'President of Kenya'},
-            {'question': 'What is E=mc2?', 'answer': 'Einstein’s equation'}
-        ]
-        correct = 0
-        total = len(mock_dataset) + 1
-        for item in mock_dataset:
-            response = chain.invoke({"question": item['question']})
-            if item['answer'].lower() in response.lower():
-                correct += 1
-        response = chain.invoke({"question": question})
-        if ground_truth.lower() in response.lower():
-            correct += 1
-        accuracy = correct / total * 100
-        logger.info(f"CLEVR/VQA Accuracy: {accuracy:.2f}%")
-        return accuracy
-    except Exception as e:
-        logger.error(f"Benchmarking failed: {e}")
-        return 0.0
-
-# Save to playground 
-def save_to_playground(question: str, output: str, history: list, accuracies: dict):
-    try:
-        data = {
-            'question': question,
-            'final_output': output,
-            'history': history,
-            'accuracies': accuracies,
-            'timestamp': logging.Formatter().formatTime(logging.makeLogRecord({}))
-        }
-        with open('playground_output.json', 'w') as f:
-            json.dump(data, f, indent=2)
-        logger.info("Saved to playground_output.json for metta-lang.dev")
-    except Exception as e:
-        logger.error(f"Playground save failed: {e}")
-
-# Chatbot loop
-def run_chatbot():
-    print("General FAQ Chatbot. Type 'exit' to quit, 'update <domain> <fact>' to add knowledge (e.g., update Science (= (E=mc2 Equation) true)).")
-    history = []
-    threading.Thread(target=autonomous_goal_setting, daemon=True).start()  # Autonomous loop
-    while True:
-        question = input("Ask a question: ")
-        if question.lower() == 'exit':
-            break
-        if question.lower().startswith('update'):
-            parts = question[6:].strip().split(' ', 1)
-            domain = parts[0] if len(parts) > 1 else "General"
-            new_fact = parts[1] if len(parts) > 1 else ""
-            update_graph(domain, new_fact)
-            print("Knowledge graph updated.")
-            history.append(f"Updated {domain}: {new_fact}")
-            continue
-        response = chain.invoke({"question": question})
-        confidence = 0.85  # Mock
-        store_memory(question, response, confidence)  # Memory
-        history.append(response)
-        accuracy = benchmark_clevr_vqa(runner, question, "President of Kenya" if "Uhuru Kenyatta" in question else "Unknown")
-        save_to_playground(question, response, history, {'clevr_vqa': accuracy})
-        # Self-reflection
-        runner.run(f'!(reflect "Query: {question}" {confidence})')
-        # Continual learning example
-        entity = question.split("Who is")[-1].strip().rstrip('?') if "Who is" in question else ""
-        if entity:
-            continual_learning(entity)
-        # Cross-domain transfer example
-        cross_domain_transfer("Kenyan-Politics", "Science", "(implies (role X president) (role X leader))")
-        print("Response:", response)
+        runner.run(f'(add-atom (error "Update" "{str(e)}"))')
 
 if __name__ == "__main__":
     run_chatbot()
