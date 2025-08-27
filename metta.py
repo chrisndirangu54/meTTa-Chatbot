@@ -624,20 +624,33 @@ def extract_facts_lightweight(text: str, threshold: float = 0.7) -> List[tuple]:
     return facts
 neural_extractor = NeuralExtractor()
 
-# LLM Integration
+
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+import logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
 def validate_openai_key(api_key: str) -> bool:
     try:
-        test_client = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, max_retries=1)
+        test_client = ChatGoogleGenerativeAI(model="gemini-1.5-flash", api_key=api_key, max_retries=1)
         test_client.invoke("Test prompt")
         return True
     except Exception as e:
-        logger.error(f"OpenAI API key validation failed: {e}")
-        runner.run(f'(add-atom (error "OpenAI" "{str(e)}"))')
+        logger.error(f"Gemini API key validation failed: {e}")
+        runner.run(f'(add-atom (error "Gemini" "{str(e)}"))')
         return False
 
-api_key = "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"
-llm_enabled = validate_openai_key(api_key)
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key, max_retries=10) if llm_enabled else None
+api_key = "AIzaSyA06u31qY8xQB5_C0U5YmGLYwzz8WjfTRw"  # Replace with your actual Gemini API key
+llm_enabled = validate_gemini_key(api_key)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, api_key=api_key, max_retries=10) if llm_enabled else None
 
 prompt = ChatPromptTemplate.from_template("""
 You are a general FAQ chatbot. Use the following context to answer the question.
