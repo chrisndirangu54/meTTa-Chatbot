@@ -200,7 +200,6 @@ import numpy as np
 import torch
 import torch_geometric.data as pyg_data  # Use explicit import for clarity
 from typing import Optional, Tuple, Dict
-
 def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
     device = torch.device('cpu')
     logger.debug("Building graph with query_emb: %s", query_emb is not None)
@@ -208,19 +207,6 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
     if not atoms:
         logger.warning("No atoms found in GroundingSpace")
         return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
-
-    if query_emb is not None:
-        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (384,):
-            logger.error(f"Invalid query embedding: shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
-            query_emb = None
-        else:
-            try:
-                _, indices = index.search(np.array([query_emb]), k=100)
-                atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
-                logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
-            except Exception as e:
-                logger.error(f"FAISS search failed: {e}")
-                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
 
     node_features = []
     batch_size = 16
@@ -233,6 +219,28 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
         logger.error(f"Node feature encoding failed: {e}")
         runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
         return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
+
+    if query_emb is not None:
+        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (1, 384):
+            logger.error(f"Invalid query embedding: shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
+            query_emb = None
+        else:
+            try:
+                if index.ntotal == 0:
+                    logger.warning("FAISS index is empty, skipping search")
+                    query_emb = None
+                else:
+                    # Ensure query_emb is 2D for FAISS
+                    query_emb = np.asarray(query_emb, dtype=np.float32)
+                    if query_emb.ndim == 1:
+                        query_emb = query_emb.reshape(1, -1)
+                    distances, indices = index.search(query_emb, k=min(100, index.ntotal))
+                    atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i != -1 and i < len(atom_vectors)]
+                    logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
+            except Exception as e:
+                logger.error(f"FAISS search failed: {e}")
+                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
+                query_emb = None
 
     node_map = {str(atom): i for i, atom in enumerate(atoms)}
     edges = []
@@ -261,7 +269,7 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
     x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
     logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
     return pyg_data.Data(x=x, edge_index=edge_index), node_map
-# Train GNN
+    # Train GNN
 def train_pattern_gnn():
     global pattern_dataset
     try:
@@ -829,10 +837,19 @@ def continual_learning(entity: str):
             web_result = (
                 "Uhuru Muigai Kenyatta, born October 26, 1961, in Nairobi, Kenya, is a Kenyan politician who served as the fourth president of Kenya from April 9, 2013, to September 13, 2022. "
                 "He is the son of Jomo Kenyatta, Kenya’s first president, and Mama Ngina Kenyatta. A member of the Kikuyu ethnic group, Uhuru was raised in a wealthy and politically influential family. "
-                "He attended St. Mary’s School in Nairobi and graduated from Amherst College in the United States with a degree in political science and economics in 1985."
+                "He attended St. Mary’s School in Nairobi and graduated from Amherst College in the United States with a degree in political science and economics in 1985. "
+                "As of August 2025, Kenyatta remains the Jubilee Party leader and serves as the AU-Kenya Peace Envoy, facilitating the EAC-Led Nairobi Peace Process in the DRC and Ethiopia. "
+                "In January 2025, he criticized African leaders for their response to Trump’s foreign aid freeze. In March 2025, the Court of Appeal upheld his allies’ leadership in the Jubilee Party."
             )
         else:
-            web_result = web_search(f"Who is {entity}?")
+            try:
+                with DDGS() as ddgs:
+                    results = [r for r in ddgs.text(f"Who is {entity}?", max_results=5)]
+                    web_result = " ".join([r.get("body", "") for r in results])
+            except Exception as e:
+                logger.error(f"Web search failed for {entity}: {e}")
+                runner.run(f'(add-atom (error "Web Search" "{str(e)}"))')
+                web_result = ""
         if not web_result or "No web results found" in web_result:
             logger.info(f"No web results for {entity}, skipping continual learning")
             return
@@ -841,8 +858,8 @@ def continual_learning(entity: str):
         logger.debug(f"Extracted facts for {entity}: {facts}")
         existing_facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
         device = torch.device('cpu')
-        query_emb = embedder.encode(f"learn-fact {entity}")
-        query_emb = torch.tensor(query_emb, dtype=torch.float).to(device)
+        query_emb = embedder.encode(f"learn-fact {entity}", convert_to_tensor=False)  # Return NumPy array
+        query_emb = np.asarray(query_emb, dtype=np.float32).reshape(1, -1)  # Ensure 2D array
         data, _ = build_graph(query_emb)
         data = data.to(device)
         rule = None
@@ -866,7 +883,7 @@ def continual_learning(entity: str):
                 rule = (rule_prompt | llm | parser).invoke({"entity": entity, "facts": facts})
                 pattern_dataset.append({
                     "query_emb": query_emb.tolist(),
-                    "context_emb": embedder.encode(str(existing_facts)).tolist(),
+                    "context_emb": embedder.encode(str(existing_facts), convert_to_tensor=False).tolist(),
                     "heuristic": rule,
                     "confidence": 0.9
                 })
