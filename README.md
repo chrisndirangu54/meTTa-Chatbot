@@ -38,8 +38,8 @@ Requirements
 Installation
 
 1. Clone the Repository:
-   git clone <repository-url>
-   cd general-faq-chatbot
+   git clone <https://github.com/chrisndirangu54/meTTa-Chatbot>
+   cd meTTa-Chatbot
 
 2. Create a Virtual Environment:
    python -m venv venv
