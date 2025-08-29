@@ -150,6 +150,3 @@ This project is licensed under the MIT License. See the LICENSE file for details
 Contact
 For questions or support, contact the maintainers via GitHub issues or email.
 
----
-
-This version removes all Markdown formatting, presenting the content in plain text. Let me know if you need further adjustments or additional details!
