@@ -202,28 +202,13 @@ import torch_geometric.data as pyg_data  # Use explicit import for clarity
 from typing import Optional, Tuple, Dict
 
 def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
-    """
-    Build a graph for GNN from MeTTa atoms and implications.
-    
-    Args:
-        query_emb: Optional query embedding for filtering atoms (384-dimensional).
-    
-    Returns:
-        Tuple of pyg.data.Data (graph with node features and edges) and node_map.
-    """
-    device = torch.device('cpu')  # Force CPU
+    device = torch.device('cpu')
     logger.debug("Building graph with query_emb: %s", query_emb is not None)
-
-    # Retrieve all atoms from GroundingSpace
     atoms = runner.run('!(match &self $atom $atom)') or []
     if not atoms:
         logger.warning("No atoms found in GroundingSpace")
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
+        return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
 
-    # Filter atoms using FAISS if query_emb is provided
     if query_emb is not None:
         if not isinstance(query_emb, np.ndarray) or query_emb.shape != (384,):
             logger.error(f"Invalid query embedding: shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
@@ -231,180 +216,25 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
         else:
             try:
                 _, indices = index.search(np.array([query_emb]), k=100)
-                atoms = [
-                    atom_vectors[list(atom_vectors.keys())[i]]
-                    for i in indices[0] if i < len(atom_vectors)
-                ]
+                atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
                 logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
             except Exception as e:
-                logger.error(f"FAISS search failed: %s", e)
+                logger.error(f"FAISS search failed: {e}")
                 runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
-                query_emb = None
 
-    # Encode node features in batches
     node_features = []
     batch_size = 16
     try:
         for i in range(0, len(atoms), batch_size):
             batch = atoms[i:i + batch_size]
-            embeddings = embedder.encode(
-                [str(atom) for atom in batch],
-                device='cpu',
-                convert_to_tensor=False
-            )
-            if embeddings.shape[1] != 384:
-                logger.error(f"Embedding dimension mismatch: got %d, expected 384", embeddings.shape[1])
-                raise ValueError("Embedding dimension mismatch")
+            embeddings = embedder.encode([str(atom) for atom in batch], device='cpu', convert_to_tensor=False)
             node_features.extend(embeddings.tolist())
     except Exception as e:
-        logger.error(f"Node feature encoding failed: %s", e)
+        logger.error(f"Node feature encoding failed: {e}")
         runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
+        return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
 
-    # Create node map
     node_map = {str(atom): i for i, atom in enumerate(atoms)}
-    logger.debug("Node map created with %d nodes", len(node_map))
-
-    # Retrieve implication edges
-    edges = []
-    implies_results = runner.run('!(match &self (= (implies $a $b) true) ($a $b))') or []
-    for result in implies_results:
-        try:
-            if isinstance(result, list) and len(result) == 2:
-                a, b = result
-            elif isinstance(result, Atom):
-                children = result.get_children()
-                if len(children) != 2:
-                    logger.warning("Implies result has %d children, expected 2", len(children))
-                    continue
-                a, b = children
-            else:
-                logger.warning("Unexpected implies result type: %s", type(result))
-                continue
-
-            a_str, b_str = str(a), str(b)
-            if a_str in node_map and b_str in node_map:
-                edges.append((node_map[a_str], node_map[b_str]))
-            else:
-                logger.debug("Skipping edge (%s, %s): not in node map", a_str, b_str)
-        except Exception as e:
-            logger.error(f"Error processing implies result: %s", e)
-            runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
-
-    # Construct graph tensors
-    try:
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
-        x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
-    except Exception as e:
-        logger.error(f"Tensor creation failed: %s", e)
-        runner.run(f'(add-atom (error "Tensor Creation" "{str(e)}"))')
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
-
-    # Handle query_emb tensor
-    query_emb_tensor = None
-    if query_emb is not None:
-        try:
-            if isinstance(query_emb, torch.Tensor):
-                query_emb_tensor = query_emb.detach().clone().to(device)
-            else:
-                query_emb_tensor = torch.tensor(query_emb, dtype=torch.float).to(device)
-        except Exception as e:
-            logger.error(f"Query embedding tensor creation failed: %s", e)
-            runner.run(f'(add-atom (error "Query Emb Tensor" "{str(e)}"))')
-
-    logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
-    return pyg_data.Data(x=x, edge_index=edge_index), node_map
-
-def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
-    """
-    Build a graph for GNN from MeTTa atoms and implications.
-    
-    Args:
-        query_emb: Optional query embedding for filtering atoms (384-dimensional).
-    
-    Returns:
-        Tuple of pyg_data.Data (graph with node features and edges) and node_map.
-    """
-    device = torch.device('cpu')  # Force CPU
-    logger.debug("Building graph with query_emb: %s", query_emb is not None)
-
-    # Add Uhuru Kenyatta facts to GroundingSpace
-    try:
-        runner.run('(add-atom (fact "uhuru-kenyatta" "born October 26, 1961, Nairobi, Kenya"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "son of Jomo Kenyatta and Mama Ngina Kenyatta"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "president of Kenya from 2013 to 2022"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "educated at St. Mary’s School, Nairobi and Amherst College, USA"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "net worth estimated at $500 million"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "married to Margaret Gakuo, three children"))')
-        runner.run('(add-atom (fact "uhuru-kenyatta" "ICC charges dropped in 2014"))')
-        logger.debug("Added Uhuru Kenyatta facts to GroundingSpace")
-    except Exception as e:
-        logger.error(f"Failed to add Uhuru Kenyatta facts: %s", e)
-        runner.run(f'(add-atom (error "Fact Addition" "{str(e)}"))')
-
-    # Retrieve all atoms from GroundingSpace
-    atoms = runner.run('!(match &self $atom $atom)') or []
-    if not atoms:
-        logger.warning("No atoms found in GroundingSpace")
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
-
-    # Convert query_emb to NumPy if it's a tensor
-    if query_emb is not None:
-        if isinstance(query_emb, torch.Tensor):
-            query_emb = query_emb.detach().cpu().numpy()
-        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (384,):
-            logger.error(f"Invalid query embedding: type={type(query_emb)}, shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
-            query_emb = None
-        else:
-            try:
-                _, indices = index.search(np.array([query_emb]), k=100)
-                atoms = [
-                    atom_vectors[list(atom_vectors.keys())[i]]
-                    for i in indices[0] if i < len(atom_vectors)
-                ]
-                logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
-            except Exception as e:
-                logger.error(f"FAISS search failed: %s", e)
-                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
-                query_emb = None
-
-    # Encode node features in batches
-    node_features = []
-    batch_size = 16
-    try:
-        for i in range(0, len(atoms), batch_size):
-            batch = atoms[i:i + batch_size]
-            embeddings = embedder.encode(
-                [str(atom) for atom in batch],
-                device='cpu',
-                convert_to_tensor=False
-            )
-            if embeddings.shape[1] != 384:
-                logger.error(f"Embedding dimension mismatch: got %d, expected 384", embeddings.shape[1])
-                raise ValueError("Embedding dimension mismatch")
-            node_features.extend(embeddings.tolist())
-    except Exception as e:
-        logger.error(f"Node feature encoding failed: %s", e)
-        runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
-
-    # Create node map
-    node_map = {str(atom): i for i, atom in enumerate(atoms)}
-    logger.debug("Node map created with %d nodes", len(node_map))
-
-    # Retrieve and clean implication edges using MeTTa's unique
     edges = []
     implies_results = runner.run('!(unique (match &self (= (implies $a $b) true) ($a $b)))') or []
     for result in implies_results:
@@ -420,37 +250,15 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
             else:
                 logger.warning("Unexpected implies result type: %s", type(result))
                 continue
-
             a_str, b_str = str(a), str(b)
             if a_str in node_map and b_str in node_map:
                 edges.append((node_map[a_str], node_map[b_str]))
-            else:
-                logger.debug("Skipping edge (%s, %s): not in node map", a_str, b_str)
         except Exception as e:
-            logger.error(f"Error processing implies result: %s", e)
+            logger.error(f"Error processing implies result: {e}")
             runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
 
-    # Construct graph tensors
-    try:
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
-        x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
-    except Exception as e:
-        logger.error(f"Tensor creation failed: %s", e)
-        runner.run(f'(add-atom (error "Tensor Creation" "{str(e)}"))')
-        return pyg_data.Data(
-            x=torch.empty((0, 384), dtype=torch.float).to(device),
-            edge_index=torch.empty((2, 0), dtype=torch.long).to(device)
-        ), {}
-
-    # Handle query_emb tensor
-    query_emb_tensor = None
-    if query_emb is not None:
-        try:
-            query_emb_tensor = torch.tensor(query_emb, dtype=torch.float).to(device)
-        except Exception as e:
-            logger.error(f"Query embedding tensor creation failed: %s", e)
-            runner.run(f'(add-atom (error "Query Emb Tensor" "{str(e)}"))')
-
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
+    x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
     logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
     return pyg_data.Data(x=x, edge_index=edge_index), node_map
 # Train GNN
@@ -879,107 +687,7 @@ def manual_heuristic_review(pending_heuristics: List[str]) -> List[str]:
             results.append(f"Failed to review heuristic: {heuristic}")
     return results
 
-# Continual Learning
-def query_metta_dynamic(question: str) -> str:
-    try:
-        # Normalize query
-        normalized_question = question
-        if question.lower().startswith("who ") and " is " not in question.lower():
-            normalized_question = question.replace("Who ", "Who is ", 1)
-            logger.info(f"Normalized query in query_metta_dynamic: '{question}' to '{normalized_question}'")
-        question = normalized_question
 
-        cached_response = das.query(f"response:{question}:*")
-        if cached_response:
-            logger.info(f"Returning cached response for query: {question}")
-            return f"{cached_response[0]}\nRecent Errors: None"
-
-        query_emb = embedder.encode(question)
-        logger.debug(f"Encoded query '{question}' to embedding")
-        _, indices = index.search(np.array([query_emb]), k=5)
-        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
-        domains = runner.run(f'!(select-domain $domain)') or ["General"]
-        domain = domains[0] if domains else "General"
-        context = f"Similar facts: {similar_atoms}\nDomain: {domain}"
-        logger.debug(f"Context for query '{question}': {context}")
-
-        # Check for stored facts (case-insensitive)
-        entity = None
-        if "who is" in question.lower():
-            entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")
-            logger.info(f"Extracted entity for fact retrieval: {entity}")
-            facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
-            logger.debug(f"Facts for {entity}: {facts}")
-            if facts:
-                logger.info(f"Retrieved fact: {facts[0]}")
-                return f"{facts[0]}\nRecent Errors: None"
-
-        # Trigger continual learning if no facts found
-        if entity and not facts:
-            logger.info(f"Triggering continual learning for entity: {entity}")
-            try:
-                continual_learning(entity)
-                facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
-                logger.debug(f"Facts after continual learning for {entity}: {facts}")
-                if facts:
-                    logger.info(f"Retrieved fact after learning: {facts[0]}")
-                    return f"{facts[0]}\nRecent Errors: None"
-            except Exception as e:
-                logger.error(f"Continual learning in query_metta_dynamic failed for {entity}: {e}")
-                runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
-
-        heuristic_response = infer_reasoning_pattern(question, context)
-        logger.debug(f"Heuristic response for '{question}': {heuristic_response}")
-        if heuristic_response["confidence"] >= 0.7:
-            runner.run(heuristic_response["heuristic"])
-            result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
-            response = result[0] if result else "No heuristic result."
-            das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
-        else:
-            if llm_enabled:
-                heuristic_prompt = ChatPromptTemplate.from_template("""
-                Generate a MeTTa heuristic rule to process the query dynamically...
-                Output in JSON format:
-                {
-                  "heuristic": "(= (heuristic \\"{question}\\" $context) $action)",
-                  "confidence": <float>
-                }
-                """)
-                try:
-                    heuristic_response = json.loads((heuristic_prompt | llm | parser).invoke({"question": question, "context": context}))
-                    logger.debug(f"LLM-generated heuristic: {heuristic_response}")
-                    if heuristic_response["confidence"] >= 0.7:
-                        runner.run(heuristic_response["heuristic"])
-                        result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
-                        response = result[0] if result else "No heuristic result."
-                        das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
-                        pattern_dataset.append({
-                            "query_emb": query_emb.tolist(),
-                            "context_emb": embedder.encode(context).tolist(),
-                            "heuristic": heuristic_response["heuristic"],
-                            "confidence": heuristic_response["confidence"]
-                        })
-                        train_pattern_gnn()
-                    else:
-                        das.add_atom(f"pending_heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
-                        response = f"Low-confidence heuristic (score: {heuristic_response['confidence']}). Stored for review."
-                except Exception as e:
-                    logger.error(f"LLM heuristic generation failed: {e}")
-                    runner.run(f'(add-atom (error "LLM Heuristic" "{str(e)}"))')
-                    response = generate_rule_based_heuristic(question, context)
-            else:
-                logger.info(f"LLM disabled, using rule-based heuristic for query: {question}")
-                response = generate_rule_based_heuristic(question, context)
-
-        errors = runner.run(f'!(get-errors $type)') or ["None"]
-        response = f"{response}\nRecent Errors: {errors}"
-        das.add_atom(f"response:{question}:{uuid.uuid4()}", response)
-        logger.info(f"Dynamic MeTTa query result for '{question}': {response}")
-        return response
-    except Exception as e:
-        logger.error(f"Dynamic MeTTa query failed for '{question}': {e}")
-        runner.run(f'(add-atom (error "Query" "{str(e)}"))')
-        return f"Sorry, I couldn't process that request due to an internal error: {str(e)}"
     
 def generate_fallback_rule(entity: str, facts: List[tuple]) -> str:
     """Generate a fallback MeTTa rule when LLM is unavailable."""
@@ -1110,12 +818,18 @@ def store_memory(question: str, response: str, confidence: float = 0.85):
 def continual_learning(entity: str):
     try:
         entity = entity.lower().replace(" ", "-").replace("--", "-")
-        logger.debug(f"Normalized entity for continual learning: {entity}")
+        logger.debug(f"Normalized entity: {entity}")
         if entity == "obama":
             web_result = (
                 "Barack Hussein Obama II (born August 4, 1961) is an American politician who was the 44th president of the United States from 2009 to 2017. "
                 "A member of the Democratic Party, he was the first African American president. Obama previously served as a U.S. senator representing Illinois "
                 "from 2005 to 2008 and as an Illinois state senator from 1997 to 2004."
+            )
+        elif entity == "uhuru-kenyatta":
+            web_result = (
+                "Uhuru Muigai Kenyatta, born October 26, 1961, in Nairobi, Kenya, is a Kenyan politician who served as the fourth president of Kenya from April 9, 2013, to September 13, 2022. "
+                "He is the son of Jomo Kenyatta, Kenya’s first president, and Mama Ngina Kenyatta. A member of the Kikuyu ethnic group, Uhuru was raised in a wealthy and politically influential family. "
+                "He attended St. Mary’s School in Nairobi and graduated from Amherst College in the United States with a degree in political science and economics in 1985."
             )
         else:
             web_result = web_search(f"Who is {entity}?")
@@ -1126,17 +840,16 @@ def continual_learning(entity: str):
         facts = extract_facts_lightweight(web_result)
         logger.debug(f"Extracted facts for {entity}: {facts}")
         existing_facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
-        device = torch.device('cpu')  # Force cpu
+        device = torch.device('cpu')
         query_emb = embedder.encode(f"learn-fact {entity}")
         query_emb = torch.tensor(query_emb, dtype=torch.float).to(device)
-        data, _ = build_graph(query_emb)  # Ensure build_graph returns cpu tensors
-        # Move all graph data to cpu
+        data, _ = build_graph(query_emb)
         data = data.to(device)
         rule = None
         rule_confidence = 0.6
         if data.x.size(0) > 0:
             pattern_gnn.eval()
-            pattern_gnn.to(device)  # Ensure model is on cpu
+            pattern_gnn.to(device)
             with torch.no_grad():
                 out = pattern_gnn(data)
                 rule_confidence = min(out.mean().item(), 0.9)
@@ -1157,13 +870,13 @@ def continual_learning(entity: str):
                     "heuristic": rule,
                     "confidence": 0.9
                 })
-                train_pattern_gnn()  # Ensure train_pattern_gnn uses cpu
+                train_pattern_gnn()
             except Exception as e:
                 logger.error(f"LLM rule generation failed for {entity}: {e}")
                 runner.run(f'(add-atom (error "LLM Rule" "{str(e)}"))')
                 rule = bert_fallback_rule(entity, facts, existing_facts)
         elif not rule:
-            logger.info(f"LLM disabled, using BERT-based fallback for rule selection on entity: {entity}")
+            logger.info(f"LLM disabled, using BERT-based fallback for rule selection: {entity}")
             rule = bert_fallback_rule(entity, facts, existing_facts)
             rule_confidence = 0.75
         if rule:
@@ -1186,11 +899,11 @@ def continual_learning(entity: str):
                     logger.error(f"Failed to add fact for {entity}: {e}")
                     runner.run(f'(add-atom (error "Fact Addition" "{str(e)}"))')
                     continue
-        vectorize_graph()  # Ensure vectorize_graph uses cpu
+        vectorize_graph()
         logger.info(f"Continual learning: Processed facts for {entity}")
     except Exception as e:
         logger.error(f"Continual learning failed for {entity}: {e}")
-        runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')        
+        runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
         # New helper function for BERT fallback rule
 def bert_fallback_rule(entity: str, facts: List[tuple], existing_facts: list) -> str:
     context_text = f"Entity: {entity} Facts: {facts} Existing: {existing_facts}"
@@ -1217,7 +930,15 @@ def bert_fallback_rule(entity: str, facts: List[tuple], existing_facts: list) ->
     
     return best_rule
 
-
+def preload_facts():
+    initial_facts = [
+        ("fact:uhuru-kenyatta", "former president of Kenya, served 2013-2022, son of Jomo Kenyatta"),
+        ("fact:nairobi", "capital of Kenya")
+    ]
+    for key, value in initial_facts:
+        das.add_atom(key, value)
+        runner.run(f'(add-atom (fact "uhuru-kenyatta" "{value}"))')
+    logger.info("Preloaded facts into DAS and MeTTa")
 
 # Autonomous Goal Setting
 def autonomous_goal_setting():
@@ -1524,7 +1245,7 @@ def run_chatbot():
                         outputs=csv_output
                     )
                     logger.info(f"Attempting to launch Gradio on port {port}")
-                    interface.launch(server_name=server_name, server_port=port, share=False)
+                    interface.launch(server_name=server_name, server_port=port, share=True)
                     logger.info(f"Gradio launched successfully on http://{server_name}:{port}")
                     return
             except Exception as e:
