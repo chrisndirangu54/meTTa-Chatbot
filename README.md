@@ -35,50 +35,24 @@ Requirements
   - Redis server for persistent storage (install via `sudo apt-get install redis-server` on Ubuntu or `brew install redis` on macOS).
   - Gemini API key for LLM functionality (set via GOOGLE_API_KEY environment variable).
 
-InstallationClone the Repository:bash
+Installation
 
-git clone <repository-url>
-cd general-faq-chatbot
+Clone the Repository: git clone https://github.com/chrisndirangu54/meTTa-Chatbot cd meTTa-Chatbot
 
-Create a Virtual Environment:bash
+Create a Virtual Environment: python -m venv venv source venv/bin/activate # On Windows: venv\Scripts\activate
 
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+Install Dependencies: pip install hyperon langchain-openai langchain-google-genai sentence-transformers faiss-cpu redis transformers datasets torch torch-geometric requests duckduckgo-search tenacity gradio pandas
 
-Install Dependencies:bash
+Install Redis (optional, for persistent storage):
 
-pip install hyperon langchain-openai langchain-google-genai sentence-transformers faiss-cpu redis transformers datasets torch torch-geometric requests duckduckgo-search tenacity gradio pandas
+Ubuntu/Debian: sudo apt-get install redis-server
+macOS: brew install redis
+Set Environment Variables:
 
-Install Redis (optional, for persistent storage):Ubuntu/Debian:bash
-
-sudo apt-get install redis-server
-
-macOS:bash
-
-brew install redis
-
-Set Environment Variables:For Gemini API:bash
-
-export GOOGLE_API_KEY="your-gemini-api-key"
-
-For Redis (if not using default 127.0.0.1:6379):bash
-
-export REDIS_HOST="your-redis-host"
-export REDIS_PORT="your-redis-port"
-export REDIS_URL="your-redis-url"  # Optional
-
-For Gradio (optional, to specify server details):bash
-
-export GRADIO_SERVER_NAME="your-server-name"  # Default: 127.0.0.1
-export GRADIO_SERVER_PORT="your-server-port"  # Default: 7860
-
-Disable GPU (if needed):
-The code is configured to use CPU-only operations. Ensure CUDA_VISIBLE_DEVICES="" is set in the environment:bash
-
-export CUDA_VISIBLE_DEVICES=""
-
-
-
+For Gemini API: export GOOGLE_API_KEY="your-gemini-api-key"
+For Redis (if not using default 127.0.0.1:6379): export REDIS_HOST="your-redis-host" export REDIS_PORT="your-redis-port" export REDIS_URL="your-redis-url" # Optional
+For Gradio (optional, to specify server details): export GRADIO_SERVER_NAME="your-server-name" # Default: 127.0.0.1 export GRADIO_SERVER_PORT="your-server-port" # Default: 7860
+Disable GPU (if needed): The code is configured to use CPU-only operations. Ensure CUDA_VISIBLE_DEVICES="" is set in the environment: export CUDA_VISIBLE_DEVICES=""
 Usage
 
 1. Run the Chatbot:
