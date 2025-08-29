@@ -35,39 +35,49 @@ Requirements
   - Redis server for persistent storage (install via `sudo apt-get install redis-server` on Ubuntu or `brew install redis` on macOS).
   - Gemini API key for LLM functionality (set via GOOGLE_API_KEY environment variable).
 
-Installation
+InstallationClone the Repository:bash
 
-1. Clone the Repository:
-   git clone <https://github.com/chrisndirangu54/meTTa-Chatbot>
-   cd meTTa-Chatbot
+git clone <repository-url>
+cd general-faq-chatbot
 
-2. Create a Virtual Environment:
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+Create a Virtual Environment:bash
 
-3. Install Dependencies:
-   pip install hyperon langchain-openai langchain-google-genai sentence-transformers faiss-cpu redis transformers datasets torch torch-geometric requests duckduckgo-search tenacity gradio pandas
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-4. Install Redis (optional, for persistent storage):
-   - Ubuntu/Debian:
-     sudo apt-get install redis-server
-   - macOS:
-     brew install redis
+Install Dependencies:bash
 
-5. Set Environment Variables:
-   - For Gemini API:
-     export GOOGLE_API_KEY="your-gemini-api-key"
-   - For Redis (if not using default 127.0.0.1:6379):
-     export REDIS_HOST="your-redis-host"
-     export REDIS_PORT="your-redis-port"
-     export REDIS_URL="your-redis-url"  # Optional
-   - For Gradio (optional, to specify server details):
-     export GRADIO_SERVER_NAME="your-server-name"  # Default: 127.0.0.1
-     export GRADIO_SERVER_PORT="your-server-port"  # Default: 7860
+pip install hyperon langchain-openai langchain-google-genai sentence-transformers faiss-cpu redis transformers datasets torch torch-geometric requests duckduckgo-search tenacity gradio pandas
 
-6. Disable GPU (if needed):
-   The code is configured to use CPU-only operations. Ensure CUDA_VISIBLE_DEVICES="" is set in the environment:
-   export CUDA_VISIBLE_DEVICES=""
+Install Redis (optional, for persistent storage):Ubuntu/Debian:bash
+
+sudo apt-get install redis-server
+
+macOS:bash
+
+brew install redis
+
+Set Environment Variables:For Gemini API:bash
+
+export GOOGLE_API_KEY="your-gemini-api-key"
+
+For Redis (if not using default 127.0.0.1:6379):bash
+
+export REDIS_HOST="your-redis-host"
+export REDIS_PORT="your-redis-port"
+export REDIS_URL="your-redis-url"  # Optional
+
+For Gradio (optional, to specify server details):bash
+
+export GRADIO_SERVER_NAME="your-server-name"  # Default: 127.0.0.1
+export GRADIO_SERVER_PORT="your-server-port"  # Default: 7860
+
+Disable GPU (if needed):
+The code is configured to use CPU-only operations. Ensure CUDA_VISIBLE_DEVICES="" is set in the environment:bash
+
+export CUDA_VISIBLE_DEVICES=""
+
+
 
 Usage
 
@@ -149,5 +159,8 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 Contact
 For questions or support, contact the maintainers via GitHub issues or email.
+
+
+
 <img width="3840" height="2314" alt="Untitled diagram _ Mermaid Chart-2025-08-29-055923" src="https://github.com/user-attachments/assets/d5db358f-5431-4cbc-9d39-f02cc1f3da68" />
 
