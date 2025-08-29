@@ -145,9 +145,10 @@ class DASClient:
             return []
 
 das = DASClient()
+knowledge_metta = """
+
 
 # Minimal knowledge graph
-knowledge_metta = """
 (: General Domain)
 (: Person Type)
 (: Role Type)
@@ -155,6 +156,7 @@ knowledge_metta = """
 (: ErrorType Type)
 (: Kenyan-Politics Domain)
 (: Science Domain)
+(: Medicine Domain)  ; Added Medicine domain
 
 ; Dynamic heuristic placeholder
 (= (heuristic $query $context)
@@ -174,7 +176,30 @@ knowledge_metta = """
 
 ; Vectorized entity definition
 (= (definition vectorize-entity) "Embed entities using SentenceTransformer for FAISS search")
+
+; Kenyan Politicians in Kenyan-Politics Domain
+(in-domain Raila-Odinga Kenyan-Politics)
+(in-domain William-Ruto Kenyan-Politics)
+(in-domain Musalia-Mudavadi Kenyan-Politics)
+(fact Raila-Odinga (role Opposition-Leader))
+(fact William-Ruto (role President))
+(fact Musalia-Mudavadi (role Prime-Cabinet-Secretary))
+
+; Medicine Domain entities
+(in-domain Malaria Medicine)
+(in-domain Tuberculosis Medicine)
+(in-domain HIV-AIDS Medicine)
+
+; Facts for Medicine Domain
+(fact Malaria (disease (symptoms fever chills headache nausea)))
+(fact Malaria (cause (parasite Plasmodium transmitted-by Anopheles-mosquito)))
+(fact Tuberculosis (disease (symptoms cough fever night-sweats weight-loss)))
+(fact Tuberculosis (cause (bacteria Mycobacterium-tuberculosis)))
+(fact HIV-AIDS (disease (symptoms fever fatigue swollen-lymph-nodes weight-loss)))
+(fact HIV-AIDS (cause (virus Human-Immunodeficiency-Virus)))
 """
+
+
 runner.run(knowledge_metta)
 logger.info("Minimal knowledge graph loaded.")
 
@@ -230,7 +255,6 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
                     logger.warning("FAISS index is empty, skipping search")
                     query_emb = None
                 else:
-                    # Ensure query_emb is 2D for FAISS
                     query_emb = np.asarray(query_emb, dtype=np.float32)
                     if query_emb.ndim == 1:
                         query_emb = query_emb.reshape(1, -1)
@@ -245,6 +269,9 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
     node_map = {str(atom): i for i, atom in enumerate(atoms)}
     edges = []
     implies_results = runner.run('!(unique (match &self (= (implies $a $b) true) ($a $b)))') or []
+    logger.debug(f"MeTTa implies query returned {len(implies_results)} results: {implies_results}")
+    if not implies_results:
+        logger.info("No implication rules found in GroundingSpace, proceeding with empty edges")
     for result in implies_results:
         try:
             if isinstance(result, list) and len(result) == 2:
@@ -252,24 +279,26 @@ def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, 
             elif isinstance(result, Atom):
                 children = result.get_children()
                 if len(children) != 2:
-                    logger.warning("Implies result has %d children, expected 2", len(children))
+                    logger.warning("Implies result has %d children, expected 2: %s", len(children), children)
                     continue
                 a, b = children
             else:
-                logger.warning("Unexpected implies result type: %s", type(result))
+                logger.warning("Unexpected implies result type: %s, value: %s", type(result), result)
                 continue
             a_str, b_str = str(a), str(b)
             if a_str in node_map and b_str in node_map:
                 edges.append((node_map[a_str], node_map[b_str]))
+            else:
+                logger.debug(f"Skipping edge: {a_str} or {b_str} not in node_map")
         except Exception as e:
-            logger.error(f"Error processing implies result: {e}")
+            logger.error(f"Error processing implies result: {e}, result: {result}")
             runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
 
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
     x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
     logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
     return pyg_data.Data(x=x, edge_index=edge_index), node_map
-    # Train GNN
+        # Train GNN
 def train_pattern_gnn():
     global pattern_dataset
     try:
@@ -469,7 +498,7 @@ def validate_openai_key(api_key: str) -> bool:
         runner.run(f'(add-atom (error "Gemini" "{str(e)}"))')
         return False
 
-api_key = "AIzaSyA06u31qY8xQB5_C0U5YmGLYwzz8WjfTRw"  # Replace with your actual Gemini API key
+api_key = "AIzaSyB7qcGYVY97ONYHsYxeou8lqsrY26TytjA"  # Replace with your actual Gemini API key
 llm_enabled = validate_openai_key(api_key)
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, api_key=api_key, max_retries=10) if llm_enabled else None
 
@@ -502,7 +531,6 @@ def infer_reasoning_pattern(question: str, context: str) -> dict:
 
 def query_metta_dynamic(question: str) -> str:
     try:
-        # Normalize query
         normalized_question = question
         if question.lower().startswith("who ") and " is " not in question.lower():
             normalized_question = question.replace("Who ", "Who is ", 1)
@@ -514,16 +542,17 @@ def query_metta_dynamic(question: str) -> str:
             logger.info(f"Returning cached response for query: {question}")
             return f"{cached_response[0]}\nRecent Errors: None"
 
-        query_emb = embedder.encode(question)
+        query_emb = embedder.encode(question, convert_to_tensor=False)
+        query_emb = np.asarray(query_emb, dtype=np.float32).reshape(1, -1)
         logger.debug(f"Encoded query '{question}' to embedding")
-        _, indices = index.search(np.array([query_emb]), k=5)
-        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
+        _, indices = index.search(query_emb, k=min(5, index.ntotal))
+        similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i != -1 and i < len(atom_vectors)]
         domains = runner.run(f'!(select-domain $domain)') or ["General"]
+        logger.debug(f"MeTTa domains query returned: {domains}")
         domain = domains[0] if isinstance(domains, list) and domains else "General"
         context = f"Similar facts: {similar_atoms}\nDomain: {domain}"
         logger.debug(f"Context for query '{question}': {context}")
 
-        # Check for stored facts (case-insensitive)
         entity = None
         if "who is" in question.lower():
             entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")
@@ -533,7 +562,6 @@ def query_metta_dynamic(question: str) -> str:
             if facts:
                 return f"{facts[0]}\nRecent Errors: None"
 
-        # Trigger continual learning if no facts found
         if entity and not facts:
             logger.info(f"Triggering continual learning for entity: {entity}")
             try:
@@ -550,6 +578,7 @@ def query_metta_dynamic(question: str) -> str:
         if heuristic_response["confidence"] >= 0.7:
             runner.run(heuristic_response["heuristic"])
             result = runner.run(f'!(heuristic "{question}" "{context}")')
+            logger.debug(f"MeTTa heuristic query returned: {result}")
             response = result[0] if isinstance(result, list) and result else "No heuristic result."
             das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
         else:
@@ -568,11 +597,12 @@ def query_metta_dynamic(question: str) -> str:
                     if heuristic_response["confidence"] >= 0.7:
                         runner.run(heuristic_response["heuristic"])
                         result = runner.run(f'!(heuristic "{question}" "{context}")')
+                        logger.debug(f"MeTTa heuristic query returned: {result}")
                         response = result[0] if isinstance(result, list) and result else "No heuristic result."
                         das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
                         pattern_dataset.append({
                             "query_emb": query_emb.tolist(),
-                            "context_emb": embedder.encode(context).tolist(),
+                            "context_emb": embedder.encode(context, convert_to_tensor=False).tolist(),
                             "heuristic": heuristic_response["heuristic"],
                             "confidence": heuristic_response["confidence"]
                         })
@@ -589,6 +619,7 @@ def query_metta_dynamic(question: str) -> str:
                 response = generate_rule_based_heuristic(question, context)
 
         errors = runner.run(f'!(get-errors $type)') or ["None"]
+        logger.debug(f"MeTTa errors query returned: {errors}")
         response = f"{response}\nRecent Errors: {errors[0] if isinstance(errors, list) and errors else errors}"
         das.add_atom(f"response:{question}:{uuid.uuid4()}", response)
         logger.info(f"Dynamic MeTTa query result for '{question}': {response}")
@@ -596,8 +627,7 @@ def query_metta_dynamic(question: str) -> str:
     except Exception as e:
         logger.error(f"Dynamic MeTTa query failed for '{question}': {e}")
         runner.run(f'(add-atom (error "Query" "{str(e)}"))')
-        return f"Sorry, I couldn't process that request due to an internal error: {str(e)}"
-            
+        return f"Sorry, I couldn't process that request due to an internal error: {str(e)}"     
 def generate_rule_based_heuristic(question: str, context: str) -> str:
     """Generate a simple MeTTa heuristic when LLM is unavailable."""
     if "who is" in question.lower():
@@ -823,105 +853,80 @@ def store_memory(question: str, response: str, confidence: float = 0.85):
     inter_id = str(uuid.uuid4())
     das.add_atom(f"interaction:{inter_id}", f"Query: {question} Response: {response} Confidence: {confidence}")
     
-def continual_learning(entity: str):
+def build_graph(query_emb: Optional[np.ndarray] = None) -> Tuple[pyg_data.Data, Dict[str, int]]:
+    device = torch.device('cpu')
+    logger.debug("Building graph with query_emb: %s", query_emb is not None)
+    atoms = runner.run('!(match &self $atom $atom)') or []
+    if not atoms:
+        logger.warning("No atoms found in GroundingSpace")
+        return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
+
+    node_features = []
+    batch_size = 16
     try:
-        entity = entity.lower().replace(" ", "-").replace("--", "-")
-        logger.debug(f"Normalized entity: {entity}")
-        if entity == "obama":
-            web_result = (
-                "Barack Hussein Obama II (born August 4, 1961) is an American politician who was the 44th president of the United States from 2009 to 2017. "
-                "A member of the Democratic Party, he was the first African American president. Obama previously served as a U.S. senator representing Illinois "
-                "from 2005 to 2008 and as an Illinois state senator from 1997 to 2004."
-            )
-        elif entity == "uhuru-kenyatta":
-            web_result = (
-                "Uhuru Muigai Kenyatta, born October 26, 1961, in Nairobi, Kenya, is a Kenyan politician who served as the fourth president of Kenya from April 9, 2013, to September 13, 2022. "
-                "He is the son of Jomo Kenyatta, Kenya’s first president, and Mama Ngina Kenyatta. A member of the Kikuyu ethnic group, Uhuru was raised in a wealthy and politically influential family. "
-                "He attended St. Mary’s School in Nairobi and graduated from Amherst College in the United States with a degree in political science and economics in 1985. "
-                "As of August 2025, Kenyatta remains the Jubilee Party leader and serves as the AU-Kenya Peace Envoy, facilitating the EAC-Led Nairobi Peace Process in the DRC and Ethiopia. "
-                "In January 2025, he criticized African leaders for their response to Trump’s foreign aid freeze. In March 2025, the Court of Appeal upheld his allies’ leadership in the Jubilee Party."
-            )
+        for i in range(0, len(atoms), batch_size):
+            batch = atoms[i:i + batch_size]
+            embeddings = embedder.encode([str(atom) for atom in batch], device='cpu', convert_to_tensor=False)
+            node_features.extend(embeddings.tolist())
+    except Exception as e:
+        logger.error(f"Node feature encoding failed: {e}")
+        runner.run(f'(add-atom (error "Node Encoding" "{str(e)}"))')
+        return pyg_data.Data(x=torch.empty((0, 384), dtype=torch.float).to(device), edge_index=torch.empty((2, 0), dtype=torch.long).to(device)), {}
+
+    if query_emb is not None:
+        if not isinstance(query_emb, np.ndarray) or query_emb.shape != (1, 384):
+            logger.error(f"Invalid query embedding: shape={query_emb.shape if isinstance(query_emb, np.ndarray) else 'not numpy array'}")
+            query_emb = None
         else:
             try:
-                with DDGS() as ddgs:
-                    results = [r for r in ddgs.text(f"Who is {entity}?", max_results=5)]
-                    web_result = " ".join([r.get("body", "") for r in results])
+                if index.ntotal == 0:
+                    logger.warning("FAISS index is empty, skipping search")
+                    query_emb = None
+                else:
+                    query_emb = np.asarray(query_emb, dtype=np.float32)
+                    if query_emb.ndim == 1:
+                        query_emb = query_emb.reshape(1, -1)
+                    distances, indices = index.search(query_emb, k=min(100, index.ntotal))
+                    atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i != -1 and i < len(atom_vectors)]
+                    logger.debug(f"Filtered %d atoms using FAISS", len(atoms))
             except Exception as e:
-                logger.error(f"Web search failed for {entity}: {e}")
-                runner.run(f'(add-atom (error "Web Search" "{str(e)}"))')
-                web_result = ""
-        if not web_result or "No web results found" in web_result:
-            logger.info(f"No web results for {entity}, skipping continual learning")
-            return
-        logger.debug(f"Web result for {entity}: {web_result[:100]}...")
-        facts = extract_facts_lightweight(web_result)
-        logger.debug(f"Extracted facts for {entity}: {facts}")
-        existing_facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
-        device = torch.device('cpu')
-        query_emb = embedder.encode(f"learn-fact {entity}", convert_to_tensor=False)  # Return NumPy array
-        query_emb = np.asarray(query_emb, dtype=np.float32).reshape(1, -1)  # Ensure 2D array
-        data, _ = build_graph(query_emb)
-        data = data.to(device)
-        rule = None
-        rule_confidence = 0.6
-        if data.x.size(0) > 0:
-            pattern_gnn.eval()
-            pattern_gnn.to(device)
-            with torch.no_grad():
-                out = pattern_gnn(data)
-                rule_confidence = min(out.mean().item(), 0.9)
-            if rule_confidence >= 0.7 and facts:
-                rule = f"(= (implies (fact \"{entity}\" \"{facts[0][1]}\") (role \"{entity}\" leader)) true)"
-        if not rule and llm_enabled:
-            rule_prompt = ChatPromptTemplate.from_template("""
-            Generate a MeTTa rule for the entity based on facts.
-            Entity: {entity}
-            Facts: {facts}
-            Output: "<MeTTa rule>"
-            """)
-            try:
-                rule = (rule_prompt | llm | parser).invoke({"entity": entity, "facts": facts})
-                pattern_dataset.append({
-                    "query_emb": query_emb.tolist(),
-                    "context_emb": embedder.encode(str(existing_facts), convert_to_tensor=False).tolist(),
-                    "heuristic": rule,
-                    "confidence": 0.9
-                })
-                train_pattern_gnn()
-            except Exception as e:
-                logger.error(f"LLM rule generation failed for {entity}: {e}")
-                runner.run(f'(add-atom (error "LLM Rule" "{str(e)}"))')
-                rule = bert_fallback_rule(entity, facts, existing_facts)
-        elif not rule:
-            logger.info(f"LLM disabled, using BERT-based fallback for rule selection: {entity}")
-            rule = bert_fallback_rule(entity, facts, existing_facts)
-            rule_confidence = 0.75
-        if rule:
-            runner.run(rule)
-            das.add_atom(f"rule:{entity}:{uuid.uuid4()}", rule)
-            logger.info(f"Induced rule: {rule} (Confidence: {rule_confidence})")
-        if not facts:
-            logger.info(f"No facts extracted for {entity}, skipping fact addition")
-            return
-        for _, fact, conf, entity_vector in facts:
-            if conf >= 0.7:
-                try:
-                    runner.run(f'!(learn-fact "{entity}" "{fact}")')
-                    fact_id = uuid.uuid4()
-                    das.add_atom(f"fact:{entity}:{fact_id}", fact)
-                    das.add_atom(f"entity_vector:{entity}:{fact_id}", entity_vector)
-                    runner.run(f'(add-atom (new-atom "{entity}"))')
-                    logger.info(f"Added fact to DAS: fact:{entity}:{fact_id}, value='{fact}'")
-                except Exception as e:
-                    logger.error(f"Failed to add fact for {entity}: {e}")
-                    runner.run(f'(add-atom (error "Fact Addition" "{str(e)}"))')
+                logger.error(f"FAISS search failed: {e}")
+                runner.run(f'(add-atom (error "FAISS Search" "{str(e)}"))')
+                query_emb = None
+
+    node_map = {str(atom): i for i, atom in enumerate(atoms)}
+    edges = []
+    implies_results = runner.run('!(unique (match &self (= (implies $a $b) true) ($a $b)))') or []
+    logger.debug(f"MeTTa implies query returned {len(implies_results)} results: {implies_results}")
+    if not implies_results:
+        logger.info("No implication rules found in GroundingSpace, proceeding with empty edges")
+    for result in implies_results:
+        try:
+            if isinstance(result, list) and len(result) == 2:
+                a, b = result
+            elif isinstance(result, Atom):
+                children = result.get_children()
+                if len(children) != 2:
+                    logger.warning("Implies result has %d children, expected 2: %s", len(children), children)
                     continue
-        vectorize_graph()
-        logger.info(f"Continual learning: Processed facts for {entity}")
-    except Exception as e:
-        logger.error(f"Continual learning failed for {entity}: {e}")
-        runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
-        # New helper function for BERT fallback rule
+                a, b = children
+            else:
+                logger.warning("Unexpected implies result type: %s, value: %s", type(result), result)
+                continue
+            a_str, b_str = str(a), str(b)
+            if a_str in node_map and b_str in node_map:
+                edges.append((node_map[a_str], node_map[b_str]))
+            else:
+                logger.debug(f"Skipping edge: {a_str} or {b_str} not in node_map")
+        except Exception as e:
+            logger.error(f"Error processing implies result: {e}, result: {result}")
+            runner.run(f'(add-atom (error "Implies Processing" "{str(e)}"))')
+
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device) if edges else torch.empty((2, 0), dtype=torch.long).to(device)
+    x = torch.tensor(node_features, dtype=torch.float).to(device) if node_features else torch.empty((0, 384), dtype=torch.float).to(device)
+    logger.debug("Graph built: nodes=%d, edges=%d", x.size(0), edge_index.size(1))
+    return pyg_data.Data(x=x, edge_index=edge_index), node_map
+            # New helper function for BERT fallback rule
 def bert_fallback_rule(entity: str, facts: List[tuple], existing_facts: list) -> str:
     context_text = f"Entity: {entity} Facts: {facts} Existing: {existing_facts}"
     
@@ -949,14 +954,19 @@ def bert_fallback_rule(entity: str, facts: List[tuple], existing_facts: list) ->
 
 def preload_facts():
     initial_facts = [
-        ("fact:uhuru-kenyatta", "former president of Kenya, served 2013-2022, son of Jomo Kenyatta"),
+        ("fact:uhuru-kenyatta", "former president of Kenya, served 2013-2022, son of Jomo Kenyatta, AU-Kenya Peace Envoy"),
         ("fact:nairobi", "capital of Kenya")
     ]
     for key, value in initial_facts:
         das.add_atom(key, value)
-        runner.run(f'(add-atom (fact "uhuru-kenyatta" "{value}"))')
-    logger.info("Preloaded facts into DAS and MeTTa")
-
+        runner.run(f'(add-atom (fact "{key.split(":")[1]}" "{value}"))')
+        # Add implication rule
+        entity = key.split(":")[1]
+        implies_rule = f"(= (implies (fact \"{entity}\" \"{value}\") (entity \"{entity}\" known)) true)"
+        runner.run(implies_rule)
+        das.add_atom(f"implies:{entity}:{uuid.uuid4()}", implies_rule)
+        logger.info(f"Preloaded fact: {key}, value='{value}'")
+        logger.info(f"Preloaded implies rule: {implies_rule}")
 # Autonomous Goal Setting
 def autonomous_goal_setting():
     while True:
