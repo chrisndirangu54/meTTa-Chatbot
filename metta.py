@@ -1,3 +1,6 @@
+
+# Install compatible versions
+
 import threading
 import time
 from hyperon import *
@@ -29,6 +32,8 @@ import os
 import shutil
 from sklearn.metrics.pairwise import cosine_similarity
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["WANDB_MODE"] = "disabled"
+os.environ["REDIS_URL"] = "redis://your-redis-host:6379"
 
 
 # Setup logging
@@ -649,7 +654,7 @@ def validate_openai_key(api_key: str) -> bool:
         return False
 
 api_key = "AIzaSyA06u31qY8xQB5_C0U5YmGLYwzz8WjfTRw"  # Replace with your actual Gemini API key
-llm_enabled = validate_gemini_key(api_key)
+llm_enabled = validate_openai_key(api_key)
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, api_key=api_key, max_retries=10) if llm_enabled else None
 
 prompt = ChatPromptTemplate.from_template("""
@@ -685,7 +690,7 @@ def query_metta_dynamic(question: str) -> str:
         normalized_question = question
         if question.lower().startswith("who ") and " is " not in question.lower():
             normalized_question = question.replace("Who ", "Who is ", 1)
-            logger.info(f"Normalized query in query_metta_dynamic: '{question}' to '{normalized_question}'")
+            logger.info(f"Normalized query: '{question}' to '{normalized_question}'")
         question = normalized_question
 
         cached_response = das.query(f"response:{question}:*")
@@ -698,15 +703,15 @@ def query_metta_dynamic(question: str) -> str:
         _, indices = index.search(np.array([query_emb]), k=5)
         similar_atoms = [atom_vectors[list(atom_vectors.keys())[i]] for i in indices[0] if i < len(atom_vectors)]
         domains = runner.run(f'!(select-domain $domain)') or ["General"]
-        domain = domains[0] if domains else "General"
+        domain = domains[0] if isinstance(domains, list) and domains else "General"
         context = f"Similar facts: {similar_atoms}\nDomain: {domain}"
         logger.debug(f"Context for query '{question}': {context}")
 
         # Check for stored facts (case-insensitive)
         entity = None
         if "who is" in question.lower():
-            entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")  # Fix double hyphens
-            logger.info(f"Extracted entity for fact retrieval: {entity}")
+            entity = question.lower().split("who is")[-1].strip().rstrip('?').replace(" ", "-").replace("--", "-")
+            logger.info(f"Extracted entity: {entity}")
             facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
             logger.debug(f"Facts for {entity}: {facts}")
             if facts:
@@ -717,19 +722,19 @@ def query_metta_dynamic(question: str) -> str:
             logger.info(f"Triggering continual learning for entity: {entity}")
             try:
                 continual_learning(entity)
-                facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")  # Re-check
+                facts = das.query(f"fact:{entity}:*") or das.query(f"fact:{entity.title()}:*")
                 if facts:
                     return f"{facts[0]}\nRecent Errors: None"
             except Exception as e:
-                logger.error(f"Continual learning in query_metta_dynamic failed for {entity}: {e}")
+                logger.error(f"Continual learning failed: {e}")
                 runner.run(f'(add-atom (error "Continual Learning" "{str(e)}"))')
 
         heuristic_response = infer_reasoning_pattern(question, context)
-        logger.debug(f"Heuristic response for '{question}': {heuristic_response}")
+        logger.debug(f"Heuristic response: {heuristic_response}")
         if heuristic_response["confidence"] >= 0.7:
             runner.run(heuristic_response["heuristic"])
-            result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
-            response = result[0] if result else "No heuristic result."
+            result = runner.run(f'!(heuristic "{question}" "{context}")')
+            response = result[0] if isinstance(result, list) and result else "No heuristic result."
             das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
         else:
             if llm_enabled:
@@ -746,8 +751,8 @@ def query_metta_dynamic(question: str) -> str:
                     logger.debug(f"LLM-generated heuristic: {heuristic_response}")
                     if heuristic_response["confidence"] >= 0.7:
                         runner.run(heuristic_response["heuristic"])
-                        result = runner.run(f'!(heuristic "{question}" "{context}")') or ["No result"]
-                        response = result[0] if result else "No heuristic result."
+                        result = runner.run(f'!(heuristic "{question}" "{context}")')
+                        response = result[0] if isinstance(result, list) and result else "No heuristic result."
                         das.add_atom(f"heuristic:{uuid.uuid4()}", f"{heuristic_response['heuristic']} (Confidence: {heuristic_response['confidence']})")
                         pattern_dataset.append({
                             "query_emb": query_emb.tolist(),
@@ -768,7 +773,7 @@ def query_metta_dynamic(question: str) -> str:
                 response = generate_rule_based_heuristic(question, context)
 
         errors = runner.run(f'!(get-errors $type)') or ["None"]
-        response = f"{response}\nRecent Errors: {errors}"
+        response = f"{response}\nRecent Errors: {errors[0] if isinstance(errors, list) and errors else errors}"
         das.add_atom(f"response:{question}:{uuid.uuid4()}", response)
         logger.info(f"Dynamic MeTTa query result for '{question}': {response}")
         return response
