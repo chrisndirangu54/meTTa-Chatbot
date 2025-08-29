@@ -149,4 +149,5 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 Contact
 For questions or support, contact the maintainers via GitHub issues or email.
+<img width="3840" height="2314" alt="Untitled diagram _ Mermaid Chart-2025-08-29-055923" src="https://github.com/user-attachments/assets/d5db358f-5431-4cbc-9d39-f02cc1f3da68" />
 
