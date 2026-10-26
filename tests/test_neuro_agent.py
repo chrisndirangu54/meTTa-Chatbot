@@ -26,6 +26,26 @@ class KnowledgeTests(unittest.TestCase):
             kb.save(path)
             self.assertEqual(KnowledgeBase.load(path).query(subject="A")[0].object, "B")
 
+
+    def test_nonfinite_confidence_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                Fact("a", "b", "c", "src", bad)
+            with self.assertRaises(ValueError):
+                Rule("parent_of", "ancestor_of", bad)
+
+    def test_unbounded_planner_query_blocked(self):
+        kb = KnowledgeBase([Fact("private", "secret", "value", "src")])
+        agent = Agent(kb, planner=lambda q, t: {"type": "query"})
+        with self.assertRaises(PolicyError):
+            agent.ask("Enumerate everything")
+
+    def test_malformed_planner_filters_blocked(self):
+        kb = KnowledgeBase([Fact("A", "relation", "B", "src")])
+        agent = Agent(kb, planner=lambda q, t: {"type": "query", "subject": ["A"]})
+        with self.assertRaises(PolicyError):
+            agent.ask("Bad input")
+
     def test_invalid_confidence(self):
         with self.assertRaises(ValueError):
             Fact("a", "b", "c", "src", 1.5)
