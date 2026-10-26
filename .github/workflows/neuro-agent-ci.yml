@@ -13,6 +13,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: Unit tests (no model weights or API keys required)
-        run: python -m unittest discover -s tests -p 'test_neuro_agent.py' -v
+        run: python -m unittest discover -s tests -p 'test_neuro*.py' -v
       - name: Syntax validation
         run: python -m compileall -q neuro_agent
