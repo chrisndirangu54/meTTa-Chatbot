@@ -1,0 +1,7 @@
+hyperon
+numpy
+faiss-cpu
+sentence-transformers
+transformers
+torch
+redis
