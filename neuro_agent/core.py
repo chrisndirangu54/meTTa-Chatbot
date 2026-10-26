@@ -30,8 +30,9 @@ class Fact:
     def __post_init__(self) -> None:
         if not all([self.subject.strip(), self.predicate.strip(), self.object.strip(), self.source.strip()]):
             raise ValueError("Facts must include subject, predicate, object, and provenance")
-        if not 0 <= self.confidence <= 1:
-            raise ValueError("Confidence must be in [0, 1]")
+        import math
+        if not math.isfinite(self.confidence) or not 0 <= self.confidence <= 1:
+            raise ValueError("Confidence must be finite and in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,13 @@ class Rule:
     antecedent: str
     consequent: str
     confidence: float = 1.0
+
+    def __post_init__(self) -> None:
+        import math
+        if not self.antecedent.strip() or not self.consequent.strip():
+            raise ValueError("Rule predicates must not be empty")
+        if not math.isfinite(self.confidence) or not 0 <= self.confidence <= 1:
+            raise ValueError("Rule confidence must be finite and in [0, 1]")
 
 
 class KnowledgeBase:
@@ -159,6 +167,14 @@ class Agent:
                 raise ValueError("Planner must return an action dictionary")
             kind = step.get("type")
             if kind == "query":
+                if set(step) - {"type", "subject", "predicate", "object"}:
+                    raise ValueError("Unexpected query fields")
+                filters = [step.get(k) for k in ("subject", "predicate", "object")]
+                if not any(isinstance(v, str) and v.strip() for v in filters):
+                    raise PolicyError("Unbounded knowledge-base enumeration denied")
+                if any(v is not None and (not isinstance(v, str) or len(v) > 512)
+                       for v in filters):
+                    raise ValueError("Invalid query filter")
                 found = self.kb.query(subject=step.get("subject"), predicate=step.get("predicate"),
                                       object=step.get("object"))
                 evidence.extend(f for f in found if f not in evidence)
