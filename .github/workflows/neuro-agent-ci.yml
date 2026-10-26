@@ -1,0 +1,18 @@
+name: Neuro-symbolic agent tests
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Unit tests (no model weights or API keys required)
+        run: python -m unittest discover -s tests -p 'test_neuro_agent.py' -v
+      - name: Syntax validation
+        run: python -m compileall -q neuro_agent
